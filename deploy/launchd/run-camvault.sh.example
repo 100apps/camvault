@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+PROJECT_DIR="/Users/CHANGE_ME/camvault"
+CONFIG_PATH="$PROJECT_DIR/config.toml"
+ENV_FILE="/Users/CHANGE_ME/.config/camvault/camvault.env"
+UV="/opt/homebrew/bin/uv"
+export PYTHONDONTWRITEBYTECODE=1
+
+if [ -f "$ENV_FILE" ]; then
+  # Keep this file outside the project, quote values for POSIX sh, and chmod 600 it.
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
+exec "$UV" run --project "$PROJECT_DIR" --no-sync --no-dev \
+  camvault serve -c "$CONFIG_PATH"

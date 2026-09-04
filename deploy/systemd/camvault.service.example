@@ -1,0 +1,26 @@
+[Unit]
+Description=CamVault ONVIF/RTSP recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=camvault
+Group=camvault
+WorkingDirectory=/opt/camvault
+EnvironmentFile=/etc/camvault/camvault.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/local/bin/uv run --project /opt/camvault --no-sync --no-dev camvault serve -c /etc/camvault/config.toml
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Local backend: change this to storage.root. The leading '-' permits WebDAV-only
+# deployments to start even when no local recording directory exists.
+ReadWritePaths=-/srv/camvault-recordings
+
+[Install]
+WantedBy=multi-user.target

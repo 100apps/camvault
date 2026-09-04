@@ -1,0 +1,14 @@
+# Merge this into the user's existing AList Compose service.
+# It intentionally does not declare an image or the persistent data volume.
+services:
+  alist:
+    environment:
+      # AList prefixes environment variables with ALIST_ unless started with --no-prefix.
+      # Effective when config force=false. Also verify data/config.json.
+      ALIST_TEMP_DIR: /run/alist-temp
+    tmpfs:
+      - /run/alist-temp:size=2g,mode=1770
+      - /tmp:size=256m,mode=1777
+    # Disable Docker's local JSON log writes. Remove this if persistent logs are required.
+    logging:
+      driver: "none"

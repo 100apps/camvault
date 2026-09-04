@@ -1,0 +1,514 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import re
+import secrets
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path, PurePosixPath
+from zoneinfo import ZoneInfo
+
+from camvault.buffer import LiveSegment
+from camvault.config import StorageConfig
+
+logger = logging.getLogger(__name__)
+
+_ARCHIVE_FILENAME_RE = re.compile(
+    r"^(?P<stamp>\d{8}T\d{6}[+-]\d{4})_"
+    r"(?P<sequence>\d{12})_"
+    r"(?P<duration>\d{9})ms_"
+    r"(?P<stream>s(?:none|[0-9a-f]{12}))_"
+    r"(?P<object>[0-9a-f]{12})\.ts$"
+)
+
+# CamVault 0.1 filenames did not include a stream tag or stable object id. Keep parsing
+# them so an in-place 0.1 -> 0.2 upgrade does not make existing local recordings
+# inaccessible through the playback route.
+_ARCHIVE_FILENAME_V1_RE = re.compile(
+    r"^(?P<stamp>\d{8}T\d{6}[+-]\d{4})_"
+    r"(?P<sequence>\d{12})_"
+    r"(?P<duration>\d{9})ms_"
+    r"(?P<object>[0-9a-f]{6})\.ts$"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveBatch:
+    camera_id: str
+    segments: tuple[LiveSegment, ...]
+    # Stable across retries, so a timeout after a successful remote commit does not create
+    # a second object under a different name.
+    object_id: str = field(default_factory=lambda: secrets.token_hex(6))
+
+    @property
+    def duration(self) -> float:
+        return sum(segment.duration for segment in self.segments)
+
+    @property
+    def size_bytes(self) -> int:
+        return sum(len(segment.data) for segment in self.segments)
+
+    @property
+    def start(self) -> datetime:
+        return self.segments[0].created_at
+
+    @property
+    def end(self) -> datetime:
+        return self.start + timedelta(seconds=self.duration)
+
+    @property
+    def stream_id(self) -> str | None:
+        values = {segment.stream_id for segment in self.segments}
+        if len(values) == 1:
+            return next(iter(values))
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveRecord:
+    camera_id: str
+    path: Path | None
+    relative_path: str
+    start: datetime
+    end: datetime
+    duration: float
+    size_bytes: int
+    sha256: str | None = None
+    segment_count: int | None = None
+    stream_id: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "camera_id": self.camera_id,
+            "relative_path": self.relative_path,
+            "start": self.start.isoformat(),
+            "end": self.end.isoformat(),
+            "duration": self.duration,
+            "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
+            "segment_count": self.segment_count,
+            "stream_id": self.stream_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedArchiveName:
+    start: datetime
+    duration: float
+    sequence: int
+    stream_id: str | None
+    object_id: str
+
+
+def _stream_tag(stream_id: str | None) -> str:
+    if stream_id is None:
+        return "snone"
+    digest = hashlib.blake2s(stream_id.encode("utf-8"), digest_size=6).hexdigest()
+    return f"s{digest}"
+
+
+def archive_relative_path(batch: ArchiveBatch, storage: StorageConfig) -> str:
+    """Return the deterministic camera-relative object path for a batch."""
+
+    if not batch.segments:
+        raise ValueError("cannot name an empty archive batch")
+    local_start = batch.start.astimezone(ZoneInfo(storage.timezone))
+    stamp = local_start.strftime("%Y%m%dT%H%M%S%z")
+    first_sequence = batch.segments[0].sequence
+    duration_ms = round(batch.duration * 1000)
+    filename = (
+        f"{stamp}_{first_sequence:012d}_{duration_ms:09d}ms_"
+        f"{_stream_tag(batch.stream_id)}_{batch.object_id}.ts"
+    )
+    return PurePosixPath(
+        local_start.strftime("%Y"),
+        local_start.strftime("%m"),
+        local_start.strftime("%d"),
+        local_start.strftime("%H"),
+        filename,
+    ).as_posix()
+
+
+def parse_archive_filename(filename: str) -> ParsedArchiveName | None:
+    match = _ARCHIVE_FILENAME_RE.fullmatch(filename)
+    legacy = False
+    if match is None:
+        match = _ARCHIVE_FILENAME_V1_RE.fullmatch(filename)
+        legacy = match is not None
+    if match is None:
+        return None
+    try:
+        start = datetime.strptime(match.group("stamp"), "%Y%m%dT%H%M%S%z").astimezone(UTC)
+        duration = int(match.group("duration")) / 1000.0
+        stream_tag = None if legacy else match.group("stream")
+        stream_id = None if stream_tag is None or stream_tag == "snone" else f"tag:{stream_tag[1:]}"
+        return ParsedArchiveName(
+            start=start,
+            duration=duration,
+            sequence=int(match.group("sequence")),
+            stream_id=stream_id,
+            object_id=match.group("object"),
+        )
+    except (ValueError, OverflowError):
+        return None
+
+
+class ArchiveAccumulator:
+    def __init__(self, *, camera_id: str, target_seconds: float, max_bytes: int) -> None:
+        self.camera_id = camera_id
+        self.target_seconds = target_seconds
+        self.max_bytes = max_bytes
+        self._segments: list[LiveSegment] = []
+        self._duration = 0.0
+        self._bytes = 0
+
+    @property
+    def duration(self) -> float:
+        return self._duration
+
+    @property
+    def size_bytes(self) -> int:
+        return self._bytes
+
+    def add(self, segment: LiveSegment) -> ArchiveBatch | None:
+        self._segments.append(segment)
+        self._duration += segment.duration
+        self._bytes += len(segment.data)
+        if self._duration >= self.target_seconds or self._bytes >= self.max_bytes:
+            return self.pop()
+        return None
+
+    def pop(self) -> ArchiveBatch | None:
+        if not self._segments:
+            return None
+        batch = ArchiveBatch(camera_id=self.camera_id, segments=tuple(self._segments))
+        self._segments = []
+        self._duration = 0.0
+        self._bytes = 0
+        return batch
+
+
+ArchiveWriter = Callable[[ArchiveBatch], Awaitable[ArchiveRecord]]
+
+
+class ArchiveManager:
+    """Aggregate small HLS segments and send larger chunks to a bounded backend writer.
+
+    `max_buffer_mb_per_camera` is enforced across the active writer, queued batch and
+    current accumulator. When a local disk or remote WebDAV target falls behind, HTTP
+    ingest is backpressured rather than allowing unbounded Python memory growth.
+    """
+
+    def __init__(
+        self,
+        *,
+        camera_ids: list[str],
+        storage: StorageConfig,
+        writer: ArchiveWriter | None = None,
+        on_written: Callable[[ArchiveRecord], None] | None = None,
+        on_error: Callable[[str, str], None] | None = None,
+    ) -> None:
+        self.storage = storage
+        self.writer = writer
+        self.max_bytes_per_camera = storage.max_buffer_mb_per_camera * 1024 * 1024
+        self.accumulators = {
+            camera_id: ArchiveAccumulator(
+                camera_id=camera_id,
+                target_seconds=storage.archive_chunk_seconds,
+                max_bytes=self.max_bytes_per_camera,
+            )
+            for camera_id in camera_ids
+        }
+        # One queued batch is sufficient. The separate byte budget is the actual hard bound.
+        self.queues: dict[str, asyncio.Queue[ArchiveBatch | None]] = {
+            camera_id: asyncio.Queue(maxsize=1) for camera_id in camera_ids
+        }
+        self.workers: dict[str, asyncio.Task[None]] = {}
+        self.on_written = on_written
+        self.on_error = on_error
+        self._closing = False
+        self._retained_bytes = {camera_id: 0 for camera_id in camera_ids}
+        self._budget_conditions = {camera_id: asyncio.Condition() for camera_id in camera_ids}
+        self._ingest_locks = {camera_id: asyncio.Lock() for camera_id in camera_ids}
+
+    def memory_bytes(self, camera_id: str | None = None) -> int:
+        if camera_id is not None:
+            return self._retained_bytes[camera_id]
+        return sum(self._retained_bytes.values())
+
+    async def start(self) -> None:
+        self._closing = False
+        for camera_id in self.accumulators:
+            if camera_id not in self.workers:
+                self.workers[camera_id] = asyncio.create_task(
+                    self._worker(camera_id), name=f"archive-{camera_id}"
+                )
+
+    async def add(self, camera_id: str, segment: LiveSegment) -> None:
+        if camera_id not in self.accumulators:
+            raise KeyError(camera_id)
+        segment_bytes = len(segment.data)
+        if segment_bytes > self.max_bytes_per_camera:
+            raise ValueError(
+                f"one media segment is {segment_bytes} bytes, larger than the per-camera "
+                f"archive memory limit ({self.max_bytes_per_camera} bytes); raise "
+                "storage.max_buffer_mb_per_camera or shorten recording.hls_segment_seconds"
+            )
+
+        # A per-camera lock covers all accumulator mutations. It also prevents multiple
+        # disconnected/restarted FFmpeg requests from piling payloads into the archive path.
+        async with self._ingest_locks[camera_id]:
+            accumulator = self.accumulators[camera_id]
+            if (
+                accumulator.size_bytes
+                and accumulator.size_bytes + segment_bytes > self.max_bytes_per_camera
+            ):
+                batch = accumulator.pop()
+                if batch is not None:
+                    await self.queues[camera_id].put(batch)
+
+            await self._reserve(camera_id, segment_bytes)
+            batch = accumulator.add(segment)
+            if batch is not None:
+                await self.queues[camera_id].put(batch)
+
+    async def rotate_camera(self, camera_id: str) -> None:
+        """Seal the current tail without waiting for backend I/O to finish."""
+
+        async with self._ingest_locks[camera_id]:
+            batch = self.accumulators[camera_id].pop()
+            if batch is not None:
+                await self.queues[camera_id].put(batch)
+
+    async def flush_camera(self, camera_id: str) -> None:
+        await self.rotate_camera(camera_id)
+        await self.queues[camera_id].join()
+
+    async def flush_all(self) -> None:
+        await asyncio.gather(*(self.flush_camera(camera_id) for camera_id in self.accumulators))
+
+    async def stop(self) -> None:
+        if not self.workers:
+            return
+        self._closing = True
+        await self.flush_all()
+        for queue in self.queues.values():
+            await queue.put(None)
+        await asyncio.gather(*self.workers.values(), return_exceptions=True)
+        self.workers.clear()
+
+    async def _reserve(self, camera_id: str, size_bytes: int) -> None:
+        condition = self._budget_conditions[camera_id]
+        async with condition:
+            await condition.wait_for(
+                lambda: self._retained_bytes[camera_id] + size_bytes <= self.max_bytes_per_camera
+            )
+            self._retained_bytes[camera_id] += size_bytes
+
+    async def _release(self, camera_id: str, size_bytes: int) -> None:
+        condition = self._budget_conditions[camera_id]
+        async with condition:
+            self._retained_bytes[camera_id] = max(0, self._retained_bytes[camera_id] - size_bytes)
+            condition.notify_all()
+
+    async def _write(self, batch: ArchiveBatch) -> ArchiveRecord:
+        if self.writer is not None:
+            return await self.writer(batch)
+        # Resolve the module-level function at call time so tests and deployments can
+        # instrument it without bypassing the archive manager's memory accounting.
+        return await asyncio.to_thread(write_archive_batch, batch, self.storage)
+
+    async def _worker(self, camera_id: str) -> None:
+        queue = self.queues[camera_id]
+        while True:
+            batch = await queue.get()
+            if batch is None:
+                queue.task_done()
+                return
+            attempt = 0
+            try:
+                while True:
+                    try:
+                        record = await self._write(batch)
+                        if self.on_written:
+                            self.on_written(record)
+                        break
+                    except Exception as exc:  # noqa: BLE001 - backend contract permits any I/O error
+                        attempt += 1
+                        message = f"archive write failed: {exc}"
+                        logger.error("camera %s: %s", camera_id, message)
+                        if self.on_error:
+                            self.on_error(camera_id, message)
+                        if self._closing:
+                            break
+                        await asyncio.sleep(min(60.0, 2.0 ** min(attempt, 6)))
+            finally:
+                await self._release(camera_id, batch.size_bytes)
+                queue.task_done()
+
+
+def ensure_storage_root(root: Path) -> None:
+    resolved = root.expanduser().resolve()
+    if resolved.parent == resolved:
+        raise ValueError("refusing to use a filesystem root as storage.root")
+    resolved.mkdir(parents=True, exist_ok=True)
+    sentinel = resolved / ".camvault-root"
+    if not sentinel.exists():
+        sentinel.write_text("CamVault managed storage root\n", encoding="utf-8")
+
+
+def _best_effort_fsync_directory(directory: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _record_from_metadata(
+    *, camera_id: str, media_path: Path, camera_root: Path, payload: dict[str, object]
+) -> ArchiveRecord:
+    start = datetime.fromisoformat(str(payload["start"]))
+    end = datetime.fromisoformat(str(payload["end"]))
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=UTC)
+    return ArchiveRecord(
+        camera_id=camera_id,
+        path=media_path,
+        relative_path=media_path.relative_to(camera_root).as_posix(),
+        start=start.astimezone(UTC),
+        end=end.astimezone(UTC),
+        duration=float(payload["duration"]),
+        size_bytes=int(payload.get("size_bytes", media_path.stat().st_size)),
+        sha256=str(payload["sha256"]) if payload.get("sha256") else None,
+        segment_count=(
+            int(payload["segment_count"]) if payload.get("segment_count") is not None else None
+        ),
+        stream_id=str(payload["stream_id"]) if payload.get("stream_id") is not None else None,
+    )
+
+
+def write_archive_batch(batch: ArchiveBatch, storage: StorageConfig) -> ArchiveRecord:
+    if not batch.segments:
+        raise ValueError("cannot write an empty archive batch")
+    ensure_storage_root(storage.root)
+    relative = archive_relative_path(batch, storage)
+    camera_root = storage.root / batch.camera_id
+    final_path = camera_root.joinpath(*PurePosixPath(relative).parts)
+    directory = final_path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+
+    stem = final_path.stem
+    partial_path = directory / f".{stem}.ts.partial"
+    metadata_path = final_path.with_suffix(".json")
+    metadata_partial = metadata_path.with_name(f".{metadata_path.name}.partial")
+
+    # Idempotent retry: a previous request may have committed remotely/locally and then
+    # timed out before the archive manager received the success result.
+    if final_path.is_file() and metadata_path.is_file():
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if payload.get("version") in {1, 2} and payload.get("format") == "mpegts":
+                return _record_from_metadata(
+                    camera_id=batch.camera_id,
+                    media_path=final_path,
+                    camera_root=camera_root,
+                    payload=payload,
+                )
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            pass
+
+    partial_path.unlink(missing_ok=True)
+    metadata_partial.unlink(missing_ok=True)
+    if final_path.exists() and not metadata_path.exists():
+        final_path.unlink(missing_ok=True)
+
+    digest = hashlib.sha256()
+    try:
+        with partial_path.open("xb") as file:
+            for segment in batch.segments:
+                file.write(segment.data)
+                digest.update(segment.data)
+            file.flush()
+            if storage.fsync:
+                os.fsync(file.fileno())
+
+        record = ArchiveRecord(
+            camera_id=batch.camera_id,
+            path=final_path,
+            relative_path=relative,
+            start=batch.start.astimezone(UTC),
+            end=batch.end.astimezone(UTC),
+            duration=batch.duration,
+            size_bytes=batch.size_bytes,
+            sha256=digest.hexdigest(),
+            segment_count=len(batch.segments),
+            stream_id=batch.stream_id,
+        )
+        metadata = record.as_dict() | {
+            "format": "mpegts",
+            "version": 2,
+            "sequences": [batch.segments[0].sequence, batch.segments[-1].sequence],
+            "object_id": batch.object_id,
+        }
+        with metadata_partial.open("x", encoding="utf-8") as file:
+            json.dump(metadata, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+            file.flush()
+            if storage.fsync:
+                os.fsync(file.fileno())
+
+        # The media file becomes visible first; the sidecar follows immediately. On any
+        # failure below, both are removed so a retry cannot leave a silent orphan.
+        os.replace(partial_path, final_path)
+        os.replace(metadata_partial, metadata_path)
+        if storage.fsync:
+            _best_effort_fsync_directory(directory)
+        return record
+    except Exception:
+        partial_path.unlink(missing_ok=True)
+        metadata_partial.unlink(missing_ok=True)
+        if final_path.exists() and not metadata_path.exists():
+            final_path.unlink(missing_ok=True)
+        raise
+
+
+def scan_archive_records(root: Path, camera_id: str) -> list[ArchiveRecord]:
+    camera_root = root / camera_id
+    if not camera_root.exists():
+        return []
+    records: list[ArchiveRecord] = []
+    for metadata_path in camera_root.rglob("*.json"):
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if payload.get("version") not in {1, 2} or payload.get("format") != "mpegts":
+                continue
+            media_path = metadata_path.with_suffix(".ts")
+            if not media_path.is_file():
+                continue
+            records.append(
+                _record_from_metadata(
+                    camera_id=camera_id,
+                    media_path=media_path,
+                    camera_root=camera_root,
+                    payload=payload,
+                )
+            )
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+    records.sort(key=lambda record: record.start)
+    return records

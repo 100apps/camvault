@@ -1,0 +1,115 @@
+[server]
+# For LAN playback use 0.0.0.0 and set CAMVAULT_PLAYBACK_TOKEN.
+# Do not bind only to a concrete LAN IP: FFmpeg ingest intentionally uses loopback.
+host = "0.0.0.0"
+port = 8088
+playback_token_env = "CAMVAULT_PLAYBACK_TOKEN"
+allow_unauthenticated_lan = false
+access_log = false
+
+[logging]
+# Recent diagnostics stay in RAM for the web console. File writes are batched.
+# Use file = "" to keep logs in RAM/console only. Place the file on the archive disk
+# when avoiding writes to the system SSD matters.
+file = "./logs/camvault.log"
+memory_records = 2000
+batch_records = 128
+flush_seconds = 30
+max_file_mb = 20
+backup_count = 5
+
+[storage]
+# "local": large sequential files on a local HDD/SSD/NAS mount.
+# "webdav": stream archive batches from RAM to AList/WebDAV; no local media spool.
+backend = "local"
+
+# Used only by backend="local". Prefer a surveillance HDD/NAS mount.
+# A relative path is resolved beside this config file.
+root = "./recordings"
+
+timezone = "Asia/Shanghai"
+archive_chunk_seconds = 300
+max_buffer_mb_per_camera = 128
+retention_days = 30
+max_storage_gb = 0
+# For WebDAV, set this to 0 unless the server exposes DAV:quota-available-bytes.
+min_free_gb = 10
+retention_check_seconds = 3600
+partial_max_age_hours = 24
+# Used only by backend="local".
+fsync = false
+
+[storage.webdav]
+# AList normally exposes WebDAV at http[s]://host:5244/dav.
+# Do not place credentials in this URL.
+url = "http://127.0.0.1:5244/dav"
+# This may include the AList storage mount, e.g. /MyCloud/CamVault.
+# Use a dedicated non-root collection.
+root = "/CamVault"
+username_env = "CAMVAULT_WEBDAV_USERNAME"
+password_env = "CAMVAULT_WEBDAV_PASSWORD"
+verify_tls = true
+connect_timeout_seconds = 10
+request_timeout_seconds = 900
+# Shared by uploads, playback proxying and WebDAV metadata operations.
+max_connections = 8
+# Upload to a transaction object and commit with WebDAV MOVE.
+# Leave enabled for AList drivers that pass `camvault storage-check`.
+atomic_upload = true
+# VOD requests within this range scan only the overlapping hour directories.
+targeted_scan_max_hours = 168
+max_index_response_mb = 64
+
+[recording]
+ffmpeg_path = "ffmpeg"
+ffprobe_path = "ffprobe"
+hls_segment_seconds = 2
+live_window_segments = 8
+max_live_memory_mb_per_camera = 64
+max_ingest_segment_mb = 64
+rtsp_transport = "tcp"
+input_timeout_seconds = 20
+startup_timeout_seconds = 60
+no_segment_timeout_seconds = 45
+health_check_seconds = 5
+restart_min_seconds = 1
+restart_max_seconds = 60
+include_audio = true
+# copy is lowest CPU and preserves quality. Use h264 only when browser compatibility requires it.
+video_codec = "copy"
+# AAC improves browser compatibility; set copy to avoid even audio transcoding.
+audio_codec = "aac"
+audio_bitrate = "96k"
+h264_preset = "veryfast"
+ffmpeg_loglevel = "warning"
+
+[[cameras]]
+id = "living_room"
+name = "客厅"
+enabled = true
+host = "192.168.1.101"
+onvif_port = 80
+username = "admin"
+password_env = "CAMVAULT_LIVING_ROOM_PASSWORD"
+# Optional profile selection. With none set, CamVault chooses the highest-resolution profile.
+# profile_name = "main"
+# profile_token = "Profile_1"
+# profile_index = 0
+
+[[cameras]]
+id = "door"
+name = "门口"
+enabled = true
+host = "192.168.1.102"
+onvif_port = 80
+username = "admin"
+password_env = "CAMVAULT_DOOR_PASSWORD"
+
+# Direct RTSP fallback example:
+# [[cameras]]
+# id = "garage"
+# name = "车库"
+# enabled = true
+# rtsp_url = "rtsp://192.168.1.103:554/Streaming/Channels/101"
+# username = "admin"
+# password_env = "CAMVAULT_GARAGE_PASSWORD"
