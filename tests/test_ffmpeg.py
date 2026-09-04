@@ -14,6 +14,8 @@ def test_camera_command_uses_http_put_without_temporary_segment_files() -> None:
         run_id="abc",
     )
     joined = " ".join(command)
+    assert f"-timeout {20 * 1_000_000}" in joined
+    assert "-rw_timeout" not in command
     assert "-method PUT" in joined
     assert "http://127.0.0.1:8088/_ingest/front/" in joined
     assert "segment_abc_" in joined

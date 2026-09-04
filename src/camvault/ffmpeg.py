@@ -133,7 +133,7 @@ def build_camera_command(
         recording.ffmpeg_loglevel,
         "-rtsp_transport",
         transport,
-        "-rw_timeout",
+        "-timeout",
         str(recording.input_timeout_seconds * 1_000_000),
         "-fflags",
         "+genpts+discardcorrupt",

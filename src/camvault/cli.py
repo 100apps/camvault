@@ -286,7 +286,7 @@ async def _camera_check(
         "error",
         "-rtsp_transport",
         transport,
-        "-rw_timeout",
+        "-timeout",
         str(config.recording.input_timeout_seconds * 1_000_000),
         "-read_intervals",
         f"%+{probe_seconds}",
