@@ -575,6 +575,7 @@ audio_codec = "aac"
 
 ## 12. 7×24 服务
 
+- OpenWrt：`deploy/openwrt/`（procd，配置/虚拟环境放在持久化 `/data`）
 - Linux：`deploy/systemd/camvault.service.example`
 - macOS：`deploy/launchd/com.camvault.recorder.plist.example`
 - Windows：`deploy/windows/install-task.ps1`
@@ -627,7 +628,8 @@ MOVE、配额和限速方面并不等价。
 - WebDAV 大范围历史/容量清理依赖 PROPFIND，极大对象树需要进一步做远端索引；
 - `atomic_upload` 是基于临时对象和 MOVE 的可见性提交，不等于所有网盘都提供数据库级事务；
 - 远端模式没有磁盘队列，这是避免 SSD 写入的主动取舍；
-- 核心代码跨平台，但三种操作系统的服务模板没有在本次环境逐一安装验证。
+- 核心代码跨平台；OpenWrt procd 模板已在本次 N5105 设备安装验证，其他操作系统的服务
+  模板没有在本次环境逐一安装验证。
 
 ## 15. 常用命令
 

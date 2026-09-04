@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+set -a
+# Keep this file out of Git and restrict it with chmod 600.
+. /data/camvault/secrets.env
+set +a
+
+exec /data/camvault/venv/bin/camvault serve -c /data/camvault/config.toml

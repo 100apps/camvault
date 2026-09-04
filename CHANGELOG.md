@@ -12,6 +12,8 @@
 - Added an error-only 7x24 FFmpeg logging default, original-stream badges and actionable
   browser codec errors. Documented real N5105 benchmarks showing HEVC passthrough at about
   1% whole-machine CPU for two camera feeds, versus about 23% for software H.264 encoding.
+- Added an OpenWrt procd deployment template with a persistent `/data` virtual environment
+  and a root-only external secrets file.
 
 ## 0.4.0 — 2026-09-04
 

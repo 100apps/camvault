@@ -31,8 +31,23 @@ RSS 为采样期间均值。AList 当时没有真实 WebDAV 上传，保持空�
 2,439,676 B/min。该值取决于摄像头码率和画面内容，不是固定容量承诺。原码直通是本机的
 低占用推荐配置；播放端必须具备相应 HEVC 支持。
 
-真实 AList/WebDAV 写入与回放尚待使用部署账号完成，因此以上性能结论只覆盖摄像头、
-CamVault、本地归档和浏览器拉流路径，不把空闲 AList 当作远端上传性能结论。
+实际 AList（本机 5244 端口）与百度网盘挂载随后完成正式链路验收：
+
+- `storage-check` 的 `OPTIONS/MKCOL/PUT/MOVE/GET/DELETE` 全部成功，测试对象已删除；
+- 两路摄像头分别向 WebDAV 提交首个约 60 秒归档，合计 2,470,508 字节，无本地媒体 spool；
+- 时间线从远端索引发现两路录像，分别返回一个连续范围；
+- 历史播放清单指向远端归档，代理 Range 请求返回 `206`、准确的 `Content-Range` 和
+  1024 字节响应体；
+- 完整取回的 4K 远端归档经 ffprobe 确认为 HEVC 3840×2160@12 fps、61.716 秒；
+- 正式服务使用 `/data/camvault` 持久虚拟环境、root-only secrets 文件和 OpenWrt procd，
+  默认 `storage.backend="webdav"`。
+
+因此 0.5.0 的实际验收覆盖摄像头、CamVault、AList、百度网盘上传、远端索引和 Range 回放
+完整路径。切换为正式 WebDAV 服务并由 procd 重启恢复后，又完成一次 30 秒 `/proc` 差分
+采样：整机 CPU 6.97%，CamVault 0.11% / 57.9 MiB，两路 FFmpeg 0.90% / 37.9 MiB，
+AList 低于 0.01% / 81.8 MiB。CamVault + FFmpeg 仍约占整机 1.01% CPU；本次约
+0.33 Mbit/s 的真实上传未给 AList 造成可测的持续 CPU 压力。瞬时峰值与长期网盘行为仍应
+由控制台/系统监控持续观察。
 
 ## 0.4.0
 
