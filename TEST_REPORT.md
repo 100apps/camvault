@@ -2,21 +2,29 @@
 
 测试日期：2026-09-04
 
-## 0.3.0
+## 0.4.0
 
-当前工作区使用 Python 3.13.11 和 OpenWrt FFmpeg/ffprobe 6.1.4 实测：
+当前工作区使用 Python 3.13.11 和持久目录中的完整静态 FFmpeg/ffprobe 7.0.2 实测：
 
-- `pytest -q`：51 项全部通过；
+- `pytest -q`：55 项全部通过；
 - `camvault self-test`：`PASS`，覆盖 FFmpeg → HTTP PUT → 有界 RAM → 原子归档 →
   HLS 直播/回放 → ffprobe 可读性；
-- `ruff check .` 与 `ruff format --check .`：通过；
-- `uv build --offline`：生成 `camvault-0.3.0` wheel 与 sdist。
+- `ruff check src tests`、`ruff format src tests`、`git diff --check`：通过；
+- 生成后的多摄像头控制台 JavaScript 通过 Node `--check` 语法验证；
+- `uv build`：生成 `camvault-0.4.0` wheel 与 sdist。
 
-0.3.0 新增测试覆盖配置原子写入/备份/冲突检测、控制 API 鉴权、日志脱敏与批量刷盘、
-日志滚动、控制台入口、手工清理以及总容量淘汰最旧录像。
+0.4.0 新增测试覆盖本地/WebDAV 写失败紧急回收、最旧优先及文件数上限、同一事务立即重试、
+多摄像头页面入口、分钟分片中间的精确历史起播，以及 FFmpeg 软件解码器识别。
 
-发布判定：**通过**。设备级验收仍需在目标机器上执行 `camvault storage-check` 和逐台
-`camvault camera-check`。
+设备级验证结果：
+
+- 两台只读 ONVIF/RTSP 探测均通过，源视频为 HEVC 640×360，音频为 G.711 A-law；
+- 两路同时试录无重启，CamVault 实时和历史输出均由 ffprobe 确认为 H.264 640×360 + AAC；
+- 真机媒体只写临时本地目录，验证后已删除，未上传到 AList/远程网盘；
+- AList/WebDAV 使用合成字节完成 OPTIONS/MKCOL/PUT/MOVE/GET Range/DELETE 与清理检查，
+  未使用摄像头画面。
+
+发布判定：**通过**。真实家庭画面写入远程网盘仍需用户另行明确授权后再做试录。
 
 ## 0.2.0 历史基线
 

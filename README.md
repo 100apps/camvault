@@ -10,8 +10,8 @@ CamVault 是一个面向家庭多摄像头、7×24 运行的 ONVIF/RTSP 录像�
   - `local`：内存聚合后，大文件顺序写 HDD/SSD/NAS 挂载目录；
   - `webdav`：内存聚合后直接流式 PUT 到 AList/WebDAV，不建立本地媒体 spool。
 - 录像按 `摄像头/年/月/日/小时` 分区，包含 SHA-256 JSON 侧车。
-- 提供带 Token 的 HTML 控制台、直播 HLS、时间范围回放、配置编辑、诊断日志和状态 API。
-- 支持保留天数、总容量、最低剩余空间及残留事务清理。
+- 提供带 Token 的多摄像头同屏控制台、直播 HLS、连续时间范围回放、配置编辑、诊断日志和状态 API。
+- 支持保留天数、总容量、最低剩余空间、写失败按最旧录像回收及残留事务清理。
 - 日志先进入有界 RAM 环并批量刷入滚动文件，减少高频小写入。
 
 ## 1. 架构
@@ -54,7 +54,7 @@ ONVIF GetProfiles / GetStreamUri
 
 1. Python 3.11 或更高版本；
 2. `uv`；
-3. FFmpeg/ffprobe，并位于 `PATH`；
+3. 完整的 FFmpeg/ffprobe（H.265 摄像头转浏览器 H.264 时需 HEVC 解码器和 libx264）；
 4. 摄像头和运行主机网络互通；
 5. WebDAV 模式下，已有可写的 AList/WebDAV 服务。
 
@@ -72,7 +72,7 @@ ffprobe -version
 ### Linux / macOS
 
 ```bash
-unzip camvault-0.3.0.zip
+unzip camvault-0.4.0.zip
 cd camvault
 uv sync
 uv run camvault init
@@ -90,7 +90,7 @@ uv run camvault serve -c config.toml
 ### Windows PowerShell
 
 ```powershell
-Expand-Archive .\camvault-0.3.0.zip -DestinationPath .
+Expand-Archive .\camvault-0.4.0.zip -DestinationPath .
 Set-Location .\camvault
 uv sync
 uv run camvault init
@@ -184,7 +184,7 @@ WS-Discovery 依赖组播。发现不到设备不代表 ONVIF 不可用；VLAN�
 backend = "local"
 root = "/surveillance/camvault"
 timezone = "Asia/Shanghai"
-archive_chunk_seconds = 300
+archive_chunk_seconds = 60
 max_buffer_mb_per_camera = 128
 fsync = false
 ```
@@ -239,7 +239,7 @@ export CAMVAULT_WEBDAV_PASSWORD='强密码'
 [storage]
 backend = "webdav"
 timezone = "Asia/Shanghai"
-archive_chunk_seconds = 300
+archive_chunk_seconds = 60
 max_buffer_mb_per_camera = 256
 retention_days = 30
 max_storage_gb = 0
@@ -293,7 +293,7 @@ deploy/alist-no-ssd/compose.override.example.yml
 
 ```toml
 [storage]
-archive_chunk_seconds = 300
+archive_chunk_seconds = 60
 max_buffer_mb_per_camera = 256
 
 [recording]
@@ -311,18 +311,22 @@ max_ingest_segment_mb = 64
 | `max_buffer_mb_per_camera` | 每摄像头归档数据硬预算；满后反压，不无限增内存 |
 | `max_live_memory_mb_per_camera` | 直播窗口字节硬上限 |
 | `max_ingest_segment_mb` | 单个 HTTP 分片上限，必须不大于归档预算 |
+| `write_failure_policy` | `delete_oldest` 在首次写失败后按最旧录像回收并立即重试；`retry` 只重试 |
+| `write_failure_reclaim_mb` | 写失败时至少尝试回收的空间 |
+| `write_failure_max_delete_files` | 单次写失败最多删除的录像文件数 |
 | `fsync` | 仅本地后端；强制刷盘增强断电一致性但增加同步写 |
 
 实际批次在“达到时间”或“达到字节预算”时结束，以先到者为准。单摄像头 4 Mbit/s：
 
 | 目标时长 | 约媒体大小 | 媒体文件/天 | 媒体+元数据 PUT/MOVE 主请求/天 |
 |---:|---:|---:|---:|
+| 60 秒 | 29 MiB | 1440 | 5760 |
 | 300 秒 | 143 MiB | 288 | 1152 |
 | 600 秒 | 286 MiB | 144 | 576 |
 | 900 秒 | 429 MiB | 96 | 384 |
 
-普通消费级网盘优先考虑 5～10 分钟、每摄像头 256～512 MiB 的归档预算，避免大量小对象和
-API 调用；仍需根据上行带宽、网盘单文件限制、内存总量和风控策略实测。
+默认 1 分钟偏向流畅历史定位。若网盘 API 次数或风控比定位速度更重要，可改为 5～10 分钟、
+每摄像头 256～512 MiB 的归档预算；仍需根据上行带宽、网盘单文件限制和内存总量实测。
 
 媒体 RAM 的稳态预算约为：
 
@@ -335,7 +339,8 @@ API 调用；仍需根据上行带宽、网盘单文件限制、内存总量和�
 
 ### 断网/网盘故障
 
-WebDAV 写入失败后，已封存批次留在 RAM 中指数退避重试；不会悄悄切换到 SSD。达到内存
+默认在 WebDAV 或本地写入第一次失败后，先按时间删除最旧的受管录像并立即重试同一批次；
+删除量和文件数均受配置限制。若仍失败，已封存批次留在 RAM 中指数退避重试，且不会悄悄切换到 SSD。达到内存
 硬预算后，后续 FFmpeg 上传被反压。网络恢复后当前批次可继续提交，但故障持续超过内存
 能力时，新录像无法无限缓存，可能形成缺口。
 
@@ -372,6 +377,9 @@ max_storage_gb = 0
 min_free_gb = 10
 retention_check_seconds = 3600
 partial_max_age_hours = 24
+write_failure_policy = "delete_oldest"
+write_failure_reclaim_mb = 512
+write_failure_max_delete_files = 100
 ```
 
 规则：
@@ -379,7 +387,8 @@ partial_max_age_hours = 24
 1. 删除超过 `retention_days` 的录像；
 2. 总量超过 `max_storage_gb` 时从最旧开始删除；
 3. 本地可用空间，或 WebDAV 暴露的 DAV quota，低于 `min_free_gb` 时继续删除；
-4. 清理超时事务对象和无元数据的受管孤儿媒体。
+4. 首次归档写失败时，按最旧优先额外回收受配置限制的空间，再立即重试同一事务；
+5. 清理超时事务对象和无元数据的受管孤儿媒体。
 
 服务启动后立即执行一次，之后按 `retention_check_seconds` 周期执行；归档写入失败时还会
 唤醒一次紧急清理。每次运行的原因、时间、删除量和错误都会出现在控制台状态与日志中。
@@ -399,7 +408,7 @@ uv run camvault retention -c config.toml
 假设 CamVault 为 `192.168.1.50:8088`：
 
 ```text
-HTML 控制台（状态、配置、日志、清理、播放器入口）
+HTML 控制台（多摄像头同屏实时/同步历史、状态、配置、日志、清理）
 http://192.168.1.50:8088/?token=TOKEN
 
 直播
@@ -446,19 +455,35 @@ WebDAV 模式下，浏览器不会获得 AList 凭据。CamVault 在服务端代
 网盘 -> AList -> CamVault -> 播放器
 ```
 
-历史播放只包含已提交的归档。不同 FFmpeg `stream_id` 或明显时间缺口之间会插入
-`#EXT-X-DISCONTINUITY`。
+历史播放只包含已提交的归档。页面把本地/WebDAV 上按日期、小时保存的分钟分片组合成一条
+连续时间线，并精确跳到用户选择的开始时间；不同 FFmpeg `stream_id` 或明显时间缺口之间会
+插入 `#EXT-X-DISCONTINUITY`。
 
 ### 编码兼容性
 
+- `video_codec="h264"`（默认）：在 CamVault 主机转码，摄像头继续输出 H.265 也能由浏览器播放；
 - `video_codec="copy"`：CPU 最低、无画质损失；摄像头输出 H.265 时多数浏览器不兼容；
-- `video_codec="h264"`：浏览器兼容更好，但显著增加 CPU/GPU 功耗；
 - `audio_codec="aac"`：把常见 G.711 等转成更兼容的 AAC；
 - `audio_codec="copy"`：最低 CPU，但浏览器可能无声；
 - `audio_codec="none"`：完全不录音。
 
 视频直拷贝只能在关键帧附近切片。摄像头 GOP 很长时，实际分片和直播延迟会大于配置值，
 建议关键帧间隔 1～2 秒。
+
+OpenWrt 软件源中的精简 FFmpeg 可能显式禁用 `h264`/`hevc` 解码器、解析器或 `libx264`。
+这不是摄像头配置问题。把完整静态版 `ffmpeg`、`ffprobe` 放到持久化目录（例如
+`/data/camvault/bin/`），配置绝对路径后运行 `camvault doctor` 和 `camera-check`：
+
+```toml
+[recording]
+ffmpeg_path = "/data/camvault/bin/ffmpeg"
+ffprobe_path = "/data/camvault/bin/ffprobe"
+video_codec = "h264"
+audio_codec = "aac"
+```
+
+`camera-check` 会报告摄像头源编码、浏览器输出编码以及是否需要改摄像头；正常结果中的
+`camera_change_required` 为 `false`。
 
 ## 11. 安全
 

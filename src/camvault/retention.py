@@ -79,7 +79,13 @@ def _prune_empty_parents(directory: Path, root: Path) -> None:
         current = current.parent
 
 
-def apply_retention(storage: StorageConfig, *, now_epoch: float | None = None) -> RetentionResult:
+def apply_retention(
+    storage: StorageConfig,
+    *,
+    now_epoch: float | None = None,
+    emergency_min_delete_bytes: int = 0,
+    emergency_max_delete_files: int | None = None,
+) -> RetentionResult:
     ensure_storage_root(storage.root)
     root = storage.root.expanduser().resolve()
     now_epoch = now_epoch if now_epoch is not None else time.time()
@@ -147,6 +153,28 @@ def apply_retention(storage: StorageConfig, *, now_epoch: float | None = None) -
             if size:
                 total -= size
                 free += size
+                files.remove(path)
+
+    # A backend can reject a write even when quota information is unavailable (common for
+    # consumer WebDAV services). In that case the archive worker requests a bounded,
+    # oldest-first reclaim before retrying the exact same transaction.
+    emergency_needed = max(0, emergency_min_delete_bytes - deleted_bytes)
+    emergency_files = 0
+    if emergency_needed > 0:
+        emergency_deleted = 0
+        for path in list(files):
+            if emergency_deleted >= emergency_needed:
+                break
+            if (
+                emergency_max_delete_files is not None
+                and emergency_files >= emergency_max_delete_files
+            ):
+                break
+            size = delete(path)
+            if size:
+                emergency_deleted += size
+                emergency_files += 1
+                total -= size
                 files.remove(path)
 
     for directory in sorted(set(deleted_parents), key=lambda item: len(item.parts), reverse=True):

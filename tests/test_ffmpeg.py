@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from camvault.config import CameraConfig, RecordingConfig
-from camvault.ffmpeg import build_camera_command, redacted_command
+from camvault.ffmpeg import build_camera_command, ffmpeg_has_decoder, redacted_command
 
 
 def test_camera_command_uses_http_put_without_temporary_segment_files() -> None:
@@ -37,3 +39,17 @@ def test_camera_command_formats_ipv6_loopback_url() -> None:
         run_id="ipv6",
     )
     assert any(item.startswith("http://[::1]:8088/_ingest/front/") for item in command)
+
+
+def test_decoder_check_requires_exact_software_decoder_name(monkeypatch) -> None:
+    output = """
+ V..... h264_v4l2m2m         V4L2 mem2mem H.264 decoder wrapper
+ VFS..D h264                 H.264 / AVC / MPEG-4 AVC
+"""
+    monkeypatch.setattr(
+        "camvault.ffmpeg.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=output),
+    )
+
+    assert ffmpeg_has_decoder("ffmpeg", "h264") is True
+    assert ffmpeg_has_decoder("ffmpeg", "hevc") is False

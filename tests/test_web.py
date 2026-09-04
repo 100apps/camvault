@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -81,6 +82,18 @@ async def test_ingest_auth_live_and_vod_playback(tmp_path: Path) -> None:
             recording = await client.get(urlsplit(media_line).path, params={"token": "play-token"})
             assert recording.status_code == 200
             assert recording.content == b"aaabbb"
+
+            records = await service.archive_records("front")
+            seek_start = records[0].start + timedelta(seconds=1)
+            seek_vod = await client.get(
+                "/vod/front/index.m3u8",
+                params={
+                    "start": seek_start.isoformat(),
+                    "end": records[0].end.isoformat(),
+                    "token": "play-token",
+                },
+            )
+            assert "#EXT-X-START:TIME-OFFSET=1.000,PRECISE=YES" in seek_vod.text
 
             status = await client.get("/api/status", params={"token": "play-token"})
             payload = status.json()
@@ -178,6 +191,12 @@ rtsp_url = "rtsp://127.0.0.1/unused"
         assert dashboard.status_code == 200
         assert "CamVault 控制台" in dashboard.text
         assert "立即清理旧录像" in dashboard.text
+        assert 'data-camera="front"' in dashboard.text
+        assert 'id="video-front"' in dashboard.text
+        assert "全部实时" in dashboard.text
+        assert "历史回放" in dashboard.text
+        assert "hls.js@1.7.2" in dashboard.text
+        assert r".join('\n')" in dashboard.text
 
 
 @pytest.mark.asyncio

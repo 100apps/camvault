@@ -130,7 +130,13 @@ class StorageBackend:
     ) -> RemoteRead | None:
         return None
 
-    async def retention(self, *, now_epoch: float | None = None) -> RetentionResult:
+    async def retention(
+        self,
+        *,
+        now_epoch: float | None = None,
+        emergency_min_delete_bytes: int = 0,
+        emergency_max_delete_files: int | None = None,
+    ) -> RetentionResult:
         raise NotImplementedError
 
     def status(self) -> dict[str, object]:
@@ -197,8 +203,20 @@ class LocalStorageBackend(StorageBackend):
             raise ValueError("invalid recording path") from exc
         return candidate
 
-    async def retention(self, *, now_epoch: float | None = None) -> RetentionResult:
-        return await asyncio.to_thread(apply_retention, self.storage, now_epoch=now_epoch)
+    async def retention(
+        self,
+        *,
+        now_epoch: float | None = None,
+        emergency_min_delete_bytes: int = 0,
+        emergency_max_delete_files: int | None = None,
+    ) -> RetentionResult:
+        return await asyncio.to_thread(
+            apply_retention,
+            self.storage,
+            now_epoch=now_epoch,
+            emergency_min_delete_bytes=emergency_min_delete_bytes,
+            emergency_max_delete_files=emergency_max_delete_files,
+        )
 
 
 class WebDAVStorageBackend(StorageBackend):
@@ -247,7 +265,7 @@ class WebDAVStorageBackend(StorageBackend):
             ),
             verify=self.config.verify_tls,
             follow_redirects=True,
-            headers={"User-Agent": "CamVault/0.3.0", "Accept-Encoding": "identity"},
+            headers={"User-Agent": "CamVault/0.4.0", "Accept-Encoding": "identity"},
         )
 
     @property
@@ -442,7 +460,13 @@ class WebDAVStorageBackend(StorageBackend):
             raise StorageBackendError(f"WebDAV GET returned HTTP {status}")
         return RemoteRead(response)
 
-    async def retention(self, *, now_epoch: float | None = None) -> RetentionResult:
+    async def retention(
+        self,
+        *,
+        now_epoch: float | None = None,
+        emergency_min_delete_bytes: int = 0,
+        emergency_max_delete_files: int | None = None,
+    ) -> RetentionResult:
         await self.start()
         now_epoch = time.time() if now_epoch is None else now_epoch
         entries_by_camera: dict[str, list[WebDAVEntry]] = {}
@@ -534,6 +558,32 @@ class WebDAVStorageBackend(StorageBackend):
                 "WebDAV server does not expose DAV:quota-available-bytes; "
                 "storage.min_free_gb cannot be enforced for this backend"
             )
+
+        # WebDAV servers such as AList may not expose quota-available-bytes. A failed
+        # archive transaction can therefore request a bounded oldest-first reclaim. Any
+        # files already removed by the normal age/size/free-space policy count toward the
+        # requested headroom, avoiding needless extra deletion.
+        emergency_needed = max(0, emergency_min_delete_bytes - deleted_bytes)
+        emergency_deleted = 0
+        emergency_files = 0
+        if emergency_needed > 0:
+            next_retained = []
+            for record in retained:
+                reached_byte_target = emergency_deleted >= emergency_needed
+                reached_file_limit = (
+                    emergency_max_delete_files is not None
+                    and emergency_files >= emergency_max_delete_files
+                )
+                if not reached_byte_target and not reached_file_limit:
+                    await delete_record(record)
+                    emergency_deleted += record.size_bytes
+                    emergency_files += 1
+                    total -= record.size_bytes
+                else:
+                    next_retained.append(record)
+            retained = next_retained
+            if free_bytes is not None:
+                free_bytes += emergency_deleted
 
         return RetentionResult(
             deleted_files=deleted_files,

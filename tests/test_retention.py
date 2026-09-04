@@ -87,6 +87,33 @@ def test_retention_deletes_oldest_until_total_size_is_below_limit(tmp_path: Path
     assert newest.exists()
 
 
+def test_emergency_retention_deletes_oldest_with_bounded_file_count(tmp_path: Path) -> None:
+    now = time.time()
+    oldest = _managed_file(tmp_path, "oldest", b"1111", now - 120)
+    middle = _managed_file(tmp_path, "middle", b"2222", now - 60)
+    newest = _managed_file(tmp_path, "newest", b"3333", now)
+    storage = StorageConfig(
+        root=tmp_path,
+        retention_days=0,
+        max_storage_gb=0,
+        min_free_gb=0,
+    )
+
+    result = apply_retention(
+        storage,
+        now_epoch=now,
+        emergency_min_delete_bytes=6,
+        emergency_max_delete_files=2,
+    )
+
+    assert result.deleted_files == 2
+    assert result.deleted_bytes == 8
+    assert result.remaining_bytes == 4
+    assert not oldest.exists()
+    assert not middle.exists()
+    assert newest.exists()
+
+
 @pytest.mark.asyncio
 async def test_archive_error_wakes_retention_without_waiting_for_schedule(tmp_path: Path) -> None:
     config = AppConfig(
@@ -95,6 +122,7 @@ async def test_archive_error_wakes_retention_without_waiting_for_schedule(tmp_pa
             retention_days=0,
             min_free_gb=0,
             retention_check_seconds=60,
+            write_failure_policy="retry",
         ),
         recording=RecordingConfig(max_ingest_segment_mb=8),
         cameras=[CameraConfig(id="front", rtsp_url="rtsp://127.0.0.1/unused")],

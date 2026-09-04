@@ -121,13 +121,18 @@ class StorageConfig(BaseModel):
     root: Path = Path("./recordings")
     webdav: WebDAVConfig = Field(default_factory=WebDAVConfig)
     timezone: str = "Asia/Shanghai"
-    archive_chunk_seconds: float = Field(default=300.0, ge=4.0, le=3600.0)
+    # Archive objects are intentionally larger than live HLS segments. One minute keeps
+    # remote-object counts reasonable while still giving history playback a quick seek.
+    archive_chunk_seconds: float = Field(default=60.0, ge=4.0, le=3600.0)
     max_buffer_mb_per_camera: int = Field(default=128, ge=8, le=4096)
     retention_days: int = Field(default=30, ge=0, le=36500)
     max_storage_gb: float = Field(default=0.0, ge=0.0)
     min_free_gb: float = Field(default=10.0, ge=0.0)
     retention_check_seconds: int = Field(default=3600, ge=30, le=86400)
     partial_max_age_hours: int = Field(default=24, ge=1, le=720)
+    write_failure_policy: Literal["retry", "delete_oldest"] = "delete_oldest"
+    write_failure_reclaim_mb: int = Field(default=512, ge=1, le=1_048_576)
+    write_failure_max_delete_files: int = Field(default=100, ge=1, le=100_000)
     fsync: bool = False
 
     @field_validator("timezone")
@@ -155,9 +160,12 @@ class RecordingConfig(BaseModel):
     restart_min_seconds: float = Field(default=1.0, ge=0.1, le=60.0)
     restart_max_seconds: float = Field(default=60.0, ge=1.0, le=3600.0)
     include_audio: bool = True
-    video_codec: Literal["copy", "h264"] = "copy"
+    # H.264 is the safe browser-facing default. Cameras may keep producing H.265/HEVC;
+    # CamVault normalizes the stream without requiring a camera-side configuration change.
+    video_codec: Literal["copy", "h264"] = "h264"
     audio_codec: Literal["copy", "aac", "none"] = "aac"
-    audio_bitrate: str = "96k"
+    # 48 kbit/s avoids FFmpeg clamping for common 8 kHz mono G.711 camera audio.
+    audio_bitrate: str = "48k"
     h264_preset: str = "veryfast"
     ffmpeg_loglevel: Literal["quiet", "panic", "fatal", "error", "warning", "info"] = "warning"
     extra_input_args: list[str] = Field(default_factory=list)

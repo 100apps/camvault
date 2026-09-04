@@ -360,6 +360,54 @@ async def test_webdav_retention_deletes_old_media_and_sidecar(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_webdav_emergency_retention_deletes_oldest_first_with_cap(
+    tmp_path: Path,
+) -> None:
+    server = MemoryWebDAV()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(server))
+    storage = _storage(tmp_path)
+    backend = WebDAVStorageBackend(storage, ["front"], client=client)
+    start = datetime(2026, 9, 4, 12, 0, tzinfo=UTC)
+    try:
+        records = []
+        for sequence, payload in enumerate((b"1111", b"2222", b"3333"), start=1):
+            records.append(
+                await backend.write_batch(
+                    ArchiveBatch(
+                        camera_id="front",
+                        segments=(
+                            _segment(
+                                sequence,
+                                payload,
+                                start + timedelta(minutes=sequence),
+                            ),
+                        ),
+                    )
+                )
+            )
+
+        result = await backend.retention(
+            now_epoch=start.timestamp(),
+            emergency_min_delete_bytes=6,
+            emergency_max_delete_files=2,
+        )
+
+        assert result.deleted_files == 2
+        assert result.deleted_bytes == 8
+        assert result.remaining_bytes == 4
+        for record in records[:2]:
+            remote = f"/dav/Cloud/CamVault/front/{record.relative_path}"
+            assert remote not in server.files
+            assert remote.replace(".ts", ".json") not in server.files
+        newest_remote = f"/dav/Cloud/CamVault/front/{records[2].relative_path}"
+        assert newest_remote in server.files
+        assert newest_remote.replace(".ts", ".json") in server.files
+    finally:
+        await backend.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_webdav_service_vod_proxies_range_without_exposing_credentials(
     tmp_path: Path,
 ) -> None:

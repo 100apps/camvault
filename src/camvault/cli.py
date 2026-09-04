@@ -15,7 +15,7 @@ import uvicorn
 
 from camvault.config import AppConfig, CameraConfig, load_config
 from camvault.discovery import discover_onvif
-from camvault.ffmpeg import FFmpegError, ffmpeg_has_encoder, inspect_ffmpeg
+from camvault.ffmpeg import FFmpegError, ffmpeg_has_decoder, ffmpeg_has_encoder, inspect_ffmpeg
 from camvault.logging_setup import config_secrets, configure_logging
 from camvault.onvif import OnvifError, resolve_camera_rtsp
 from camvault.security import redact_data, redact_text, redact_url
@@ -152,6 +152,23 @@ def command_doctor(args: argparse.Namespace) -> int:
                     "detail": "video_codec=h264 requires an FFmpeg build with libx264",
                 }
             )
+
+    for decoder in ("h264", "hevc"):
+        available = ffmpeg_has_decoder(config.recording.ffmpeg_path, decoder)
+        findings.append(
+            {
+                "check": f"ffmpeg:decoder:{decoder}",
+                "result": "PASS" if available else "WARN",
+                "detail": (
+                    f"software {decoder.upper()} decoder is available"
+                    if available
+                    else (
+                        f"software {decoder.upper()} decoder is missing; cameras using this "
+                        "codec cannot be normalized for browser playback"
+                    )
+                ),
+            }
+        )
 
     try:
         health = asyncio.run(_storage_health(config))
@@ -314,6 +331,33 @@ async def _camera_check(
         password = camera.resolved_password() or ""
         raise RuntimeError(redact_text(stderr.decode(errors="replace"), (password,)).strip())
     probe_payload = json.loads(stdout)
+    video_stream = next(
+        (
+            stream
+            for stream in probe_payload.get("streams", [])
+            if stream.get("codec_type") == "video"
+        ),
+        None,
+    )
+    source_codec = video_stream.get("codec_name") if isinstance(video_stream, dict) else None
+    target_codec = camera.video_codec or config.recording.video_codec
+    if target_codec == "h264" and isinstance(source_codec, str):
+        if not ffmpeg_has_decoder(config.recording.ffmpeg_path, source_codec):
+            raise RuntimeError(
+                f"configured FFmpeg cannot decode camera codec {source_codec!r}; "
+                "use a complete FFmpeg build and set recording.ffmpeg_path/ffprobe_path"
+            )
+        if not ffmpeg_has_encoder(config.recording.ffmpeg_path, "libx264"):
+            raise RuntimeError(
+                "video_codec=h264 requires a complete FFmpeg build with libx264; "
+                "set recording.ffmpeg_path/ffprobe_path to that build"
+            )
+    result["playback_pipeline"] = {
+        "source_video_codec": source_codec,
+        "output_video_codec": target_codec,
+        "camera_change_required": False,
+        "browser_compatible": target_codec == "h264" or source_codec == "h264",
+    }
     result["ffprobe"] = redact_data(
         probe_payload,
         (camera.resolved_password() or "",),

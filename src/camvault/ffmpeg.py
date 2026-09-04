@@ -36,10 +36,10 @@ def inspect_ffmpeg(executable: str) -> FFmpegInfo:
     return FFmpegInfo(executable=resolved, version_line=first_line)
 
 
-def ffmpeg_has_encoder(executable: str, encoder: str) -> bool:
+def _ffmpeg_has_component(executable: str, table: str, component: str) -> bool:
     try:
         result = subprocess.run(
-            [executable, "-hide_banner", "-encoders"],
+            [executable, "-hide_banner", table],
             check=True,
             capture_output=True,
             text=True,
@@ -49,10 +49,18 @@ def ffmpeg_has_encoder(executable: str, encoder: str) -> bool:
         return False
     for line in result.stdout.splitlines():
         parts = line.split()
-        # FFmpeg encoder table rows are: capability-flags, encoder-name, description.
-        if len(parts) >= 2 and parts[1] == encoder:
+        # FFmpeg codec table rows are: capability-flags, component-name, description.
+        if len(parts) >= 2 and parts[1] == component:
             return True
     return False
+
+
+def ffmpeg_has_encoder(executable: str, encoder: str) -> bool:
+    return _ffmpeg_has_component(executable, "-encoders", encoder)
+
+
+def ffmpeg_has_decoder(executable: str, decoder: str) -> bool:
+    return _ffmpeg_has_component(executable, "-decoders", decoder)
 
 
 def _effective(camera: CameraConfig, recording: RecordingConfig) -> tuple[bool, str, str, str]:

@@ -77,6 +77,7 @@ class CamVaultService:
             writer=self.storage_backend.write_batch,
             on_written=self._on_archive_written,
             on_error=self._on_archive_error,
+            on_reclaim=self._reclaim_after_write_failure,
         )
         self.ingest_secret = secrets.token_urlsafe(32)
         self.playback_token = config.server.resolved_playback_token()
@@ -267,13 +268,22 @@ class CamVaultService:
             return []
         return self.recent_logs.snapshot(after=after, limit=limit)
 
-    async def run_retention(self, *, reason: str = "manual") -> RetentionResult:
+    async def run_retention(
+        self,
+        *,
+        reason: str = "manual",
+        emergency_min_delete_bytes: int = 0,
+        emergency_max_delete_files: int | None = None,
+    ) -> RetentionResult:
         async with self._retention_lock:
             self.last_retention_started_at = datetime.now(UTC)
             self.last_retention_reason = reason
             self.last_retention_error = None
             try:
-                result = await self.storage_backend.retention()
+                result = await self.storage_backend.retention(
+                    emergency_min_delete_bytes=emergency_min_delete_bytes,
+                    emergency_max_delete_files=emergency_max_delete_files,
+                )
             except asyncio.CancelledError:
                 raise
             except (OSError, ValueError, StorageBackendError) as exc:
@@ -315,6 +325,11 @@ class CamVaultService:
                     "max_storage_gb": self.config.storage.max_storage_gb,
                     "min_free_gb": self.config.storage.min_free_gb,
                     "check_seconds": self.config.storage.retention_check_seconds,
+                    "write_failure_policy": self.config.storage.write_failure_policy,
+                    "write_failure_reclaim_mb": self.config.storage.write_failure_reclaim_mb,
+                    "write_failure_max_delete_files": (
+                        self.config.storage.write_failure_max_delete_files
+                    ),
                 },
                 "runs": self.retention_runs,
                 "last_reason": self.last_retention_reason,
@@ -356,9 +371,31 @@ class CamVaultService:
         runtime.last_error = message
         runtime.detail = message
         runtime.touch()
-        # A full local disk or exhausted remote quota often surfaces first as an archive
-        # write error. Wake cleanup immediately instead of waiting for the hourly timer.
-        self._retention_wakeup.set()
+        # With retry-only behavior, still run the configured age/size/free-space policy
+        # immediately. delete_oldest is handled synchronously by the archive worker so the
+        # exact same transaction can be retried after space is reclaimed.
+        if self.config.storage.write_failure_policy == "retry":
+            self._retention_wakeup.set()
+
+    async def _reclaim_after_write_failure(
+        self, camera_id: str, failed_batch_bytes: int
+    ) -> RetentionResult:
+        requested = max(
+            failed_batch_bytes,
+            self.config.storage.write_failure_reclaim_mb * 1024 * 1024,
+        )
+        logger.warning(
+            "camera %s: archive write failed; reclaiming up to configured oldest-first "
+            "headroom (target_bytes=%d, max_files=%d)",
+            camera_id,
+            requested,
+            self.config.storage.write_failure_max_delete_files,
+        )
+        return await self.run_retention(
+            reason=f"archive-write-failure:{camera_id}",
+            emergency_min_delete_bytes=requested,
+            emergency_max_delete_files=self.config.storage.write_failure_max_delete_files,
+        )
 
     async def _retention_loop(self) -> None:
         reason = "startup"

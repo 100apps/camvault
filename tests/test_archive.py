@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
@@ -10,6 +11,7 @@ import pytest
 from camvault.archive import (
     ArchiveBatch,
     ArchiveManager,
+    ArchiveRecord,
     parse_archive_filename,
     scan_archive_records,
     write_archive_batch,
@@ -181,6 +183,62 @@ async def test_rotate_camera_seals_short_tail_without_waiting_for_target(
         assert len(records) == 1
         assert records[0].path.read_bytes() == b"tail"
         assert records[0].stream_id == "run-tail"
+    finally:
+        await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_archive_write_failure_reclaims_oldest_then_retries_immediately(
+    tmp_path: Path,
+) -> None:
+    storage = StorageConfig(
+        root=tmp_path,
+        timezone="UTC",
+        archive_chunk_seconds=4,
+        max_buffer_mb_per_camera=8,
+        min_free_gb=0,
+        write_failure_policy="delete_oldest",
+    )
+    writes: list[ArchiveBatch] = []
+    reclaims: list[tuple[str, int]] = []
+
+    async def flaky_writer(batch: ArchiveBatch) -> ArchiveRecord:
+        writes.append(batch)
+        if len(writes) == 1:
+            raise OSError("no space left")
+        path = tmp_path / "recovered.ts"
+        path.write_bytes(b"".join(segment.data for segment in batch.segments))
+        return ArchiveRecord(
+            camera_id=batch.camera_id,
+            path=path,
+            relative_path=path.name,
+            start=batch.start,
+            end=batch.end,
+            duration=batch.duration,
+            size_bytes=batch.size_bytes,
+        )
+
+    async def reclaim(camera_id: str, failed_batch_bytes: int) -> object:
+        reclaims.append((camera_id, failed_batch_bytes))
+        return object()
+
+    manager = ArchiveManager(
+        camera_ids=["cam"],
+        storage=storage,
+        writer=flaky_writer,
+        on_reclaim=reclaim,
+    )
+    await manager.start()
+    try:
+        start = datetime.now(UTC)
+        await manager.add("cam", _segment(0, b"aaa", start))
+        await manager.add("cam", _segment(1, b"bbbb", start + timedelta(seconds=2)))
+        await asyncio.wait_for(manager.flush_all(), timeout=1)
+
+        assert len(writes) == 2
+        assert writes[0] is writes[1]
+        assert reclaims == [("cam", 7)]
+        assert (tmp_path / "recovered.ts").read_bytes() == b"aaabbbb"
     finally:
         await manager.stop()
 

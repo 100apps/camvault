@@ -143,13 +143,16 @@ $env:CAMVAULT_WEBDAV_PASSWORD = '替换成强密码'
 [storage]
 backend = "webdav"
 timezone = "Asia/Shanghai"
-archive_chunk_seconds = 300
+archive_chunk_seconds = 60
 max_buffer_mb_per_camera = 256
 retention_days = 30
 max_storage_gb = 0
 # AList/网盘若不提供 DAV quota，设为 0。
 min_free_gb = 0
 partial_max_age_hours = 24
+write_failure_policy = "delete_oldest"
+write_failure_reclaim_mb = 512
+write_failure_max_delete_files = 100
 
 [storage.webdav]
 url = "http://127.0.0.1:5244/dav"
@@ -322,6 +325,7 @@ API 调用。实际批次结束条件为：
 
 | 目标批次 | 约媒体大小 | 每天媒体文件数 | PUT+MOVE 主变更请求/天 |
 |---:|---:|---:|---:|
+| 60 秒 | 29 MiB | 1440 | 5760 |
 | 300 秒 | 143 MiB | 288 | 1152 |
 | 600 秒 | 286 MiB | 144 | 576 |
 | 900 秒 | 429 MiB | 96 | 384 |
@@ -331,7 +335,8 @@ API 调用。实际批次结束条件为：
 
 推荐：
 
-- 普通消费级网盘：`archive_chunk_seconds = 300~600`；
+- 交互式历史回放优先：`archive_chunk_seconds = 60`，首帧和时间定位更快；
+- 网盘 API 次数/风控优先：可提高到 `archive_chunk_seconds = 300~600`；
 - 4 Mbit/s、5 分钟：`max_buffer_mb_per_camera >= 192`，建议 256；
 - 4 Mbit/s、10 分钟：建议 384 或 512；
 - `max_connections` 至少覆盖并发上传摄像头数，再留 2~4 个连接给播放和 PROPFIND；
@@ -350,6 +355,11 @@ max_buffer_mb_per_camera + max_live_memory_mb_per_camera
 ```
 
 接收 HTTP 分片时还有最多一个分片的瞬时缓冲。多个摄像头按台数线性增加。
+
+如果 PUT/MOVE 因远端容量不足而首次失败，默认策略会扫描已提交记录、按时间删除最旧录像，
+至少尝试回收 `write_failure_reclaim_mb`，但不超过
+`write_failure_max_delete_files`，随后立即重试同一个确定性事务。把
+`write_failure_policy` 设为 `retry` 可禁用错误触发的删除，仅保留退避重试。
 
 AList 的 tmpfs 容量应覆盖底层驱动最坏情况下同时缓存的完整上传。保守估算：
 

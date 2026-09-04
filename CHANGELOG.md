@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 — 2026-09-04
+
+- Added configurable day/size/free-space limits and bounded oldest-first emergency
+  reclamation before retrying a failed archive write.
+- Added an efficient multi-camera live/history grid; history playlists hide minute-sized,
+  date/hour-partitioned local or WebDAV objects behind one continuous timeline.
+- Made H.264 normalization the browser-compatible default so fixed-function H.265 cameras
+  do not need to be reconfigured, with explicit FFmpeg decoder/encoder diagnostics.
+
 ## 0.3.0 — 2026-09-04
 
 - Expanded the HTML console with storage/RAM/retention status, configuration editing,

@@ -28,7 +28,7 @@ backend = "local"
 root = "./recordings"
 
 timezone = "Asia/Shanghai"
-archive_chunk_seconds = 300
+archive_chunk_seconds = 60
 max_buffer_mb_per_camera = 128
 retention_days = 30
 max_storage_gb = 0
@@ -36,6 +36,11 @@ max_storage_gb = 0
 min_free_gb = 10
 retention_check_seconds = 3600
 partial_max_age_hours = 24
+# On the first archive write failure, delete the oldest managed recordings and retry
+# the identical archive transaction. Use "retry" to never delete because of a write error.
+write_failure_policy = "delete_oldest"
+write_failure_reclaim_mb = 512
+write_failure_max_delete_files = 100
 # Used only by backend="local".
 fsync = false
 
@@ -75,11 +80,12 @@ health_check_seconds = 5
 restart_min_seconds = 1
 restart_max_seconds = 60
 include_audio = true
-# copy is lowest CPU and preserves quality. Use h264 only when browser compatibility requires it.
-video_codec = "copy"
+# Keeps browser playback working when an unchangeable camera outputs H.265/HEVC.
+# Requires an FFmpeg build with the source decoder and libx264.
+video_codec = "h264"
 # AAC improves browser compatibility; set copy to avoid even audio transcoding.
 audio_codec = "aac"
-audio_bitrate = "96k"
+audio_bitrate = "48k"
 h264_preset = "veryfast"
 ffmpeg_loglevel = "warning"
 

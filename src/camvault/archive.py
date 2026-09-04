@@ -194,6 +194,7 @@ class ArchiveAccumulator:
 
 
 ArchiveWriter = Callable[[ArchiveBatch], Awaitable[ArchiveRecord]]
+ArchiveReclaimer = Callable[[str, int], Awaitable[object]]
 
 
 class ArchiveManager:
@@ -212,6 +213,7 @@ class ArchiveManager:
         writer: ArchiveWriter | None = None,
         on_written: Callable[[ArchiveRecord], None] | None = None,
         on_error: Callable[[str, str], None] | None = None,
+        on_reclaim: ArchiveReclaimer | None = None,
     ) -> None:
         self.storage = storage
         self.writer = writer
@@ -231,6 +233,7 @@ class ArchiveManager:
         self.workers: dict[str, asyncio.Task[None]] = {}
         self.on_written = on_written
         self.on_error = on_error
+        self.on_reclaim = on_reclaim
         self._closing = False
         self._retained_bytes = {camera_id: 0 for camera_id in camera_ids}
         self._budget_conditions = {camera_id: asyncio.Condition() for camera_id in camera_ids}
@@ -346,6 +349,24 @@ class ArchiveManager:
                             self.on_error(camera_id, message)
                         if self._closing:
                             break
+                        if (
+                            attempt == 1
+                            and self.storage.write_failure_policy == "delete_oldest"
+                            and self.on_reclaim is not None
+                        ):
+                            try:
+                                await self.on_reclaim(camera_id, batch.size_bytes)
+                            except Exception as reclaim_exc:  # noqa: BLE001
+                                logger.error(
+                                    "camera %s: emergency oldest-first reclaim failed: %s",
+                                    camera_id,
+                                    reclaim_exc,
+                                )
+                            else:
+                                # Retry the identical deterministic transaction immediately.
+                                # If the failure was not capacity-related, later attempts use
+                                # the normal bounded exponential backoff without more deletion.
+                                continue
                         await asyncio.sleep(min(60.0, 2.0 ** min(attempt, 6)))
             finally:
                 await self._release(camera_id, batch.size_bytes)
