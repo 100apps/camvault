@@ -9,7 +9,8 @@ import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from urllib.parse import quote
+from importlib.resources import files
+from urllib.parse import parse_qs, quote
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
@@ -18,6 +19,7 @@ from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     PlainTextResponse,
+    RedirectResponse,
     StreamingResponse,
 )
 from starlette.background import BackgroundTask
@@ -30,6 +32,11 @@ from camvault.service import CamVaultService
 from camvault.storage import StorageBackendError
 
 _FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,180}$")
+_SESSION_COOKIE = "camvault_session"
+
+
+def _asset_text(name: str) -> str:
+    return files("camvault").joinpath("web_assets", name).read_text(encoding="utf-8")
 
 
 class SecurityHeadersMiddleware:
@@ -81,6 +88,10 @@ def _script_json(value: object) -> str:
     )
 
 
+def _constant_time_text_equal(left: str, right: str) -> bool:
+    return secrets.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
 def _parse_datetime(value: str | None, timezone_name: str) -> datetime | None:
     if value is None:
         return None
@@ -122,7 +133,7 @@ def create_app(
 
     app = FastAPI(
         title="CamVault",
-        version="0.4.0",
+        version="0.5.0",
         description="RAM-buffered ONVIF/RTSP recorder with local and WebDAV archives",
         lifespan=lifespan,
         docs_url="/api/docs",
@@ -141,23 +152,38 @@ def create_app(
             provided = authorization[7:].strip()
         return provided
 
-    async def require_playback_auth(request: Request) -> None:
+    def has_browser_session(request: Request) -> bool:
+        supplied = request.cookies.get(_SESSION_COOKIE, "")
+        return bool(service.web_password and service.valid_browser_session(supplied))
+
+    def has_playback_auth(request: Request, *, allow_query: bool = True) -> bool:
+        if has_browser_session(request):
+            return True
         expected = service.playback_token
-        if not expected:
+        if expected:
+            provided = supplied_token(request, allow_query=allow_query)
+            return bool(provided and _constant_time_text_equal(provided, expected))
+        return not service.web_password
+
+    async def require_playback_auth(request: Request) -> None:
+        if has_playback_auth(request):
             return
-        provided = supplied_token(request, allow_query=True)
-        if not provided or not secrets.compare_digest(provided, expected):
-            raise HTTPException(
-                status_code=401,
-                detail="missing or invalid playback token",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        raise HTTPException(
+            status_code=401,
+            detail="authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     async def require_control_auth(request: Request) -> None:
+        if has_browser_session(request):
+            csrf = request.headers.get("X-CamVault-CSRF", "")
+            if not csrf or not _constant_time_text_equal(csrf, service.csrf_token):
+                raise HTTPException(status_code=403, detail="missing or invalid CSRF token")
+            return
         expected = service.playback_token
         if expected:
             provided = supplied_token(request, allow_query=False)
-            if not provided or not secrets.compare_digest(provided, expected):
+            if not provided or not _constant_time_text_equal(provided, expected):
                 raise HTTPException(
                     status_code=401,
                     detail="control API requires a token header",
@@ -166,6 +192,77 @@ def create_app(
             return
         if not _is_loopback(request.client.host if request.client else None):
             raise HTTPException(status_code=403, detail="control API is loopback-only")
+
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_page(request: Request, next: str = "/") -> Response:
+        if has_browser_session(request) or not service.web_password:
+            return RedirectResponse(url="/", status_code=303)
+        safe_next = next if next.startswith("/") and not next.startswith("//") else "/"
+        page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · CamVault</title>
+<style>{_asset_text("login.css")}</style></head><body><main><section class="login-card">
+<div class="mark" aria-hidden="true"><span></span></div><p class="eyebrow">CAMVAULT</p>
+<h1>欢迎回来</h1><p class="lead">登录以查看实时画面与录像归档</p>
+<form method="post" action="/login"><input type="hidden" name="next" value="{html.escape(safe_next, quote=True)}">
+<label for="password">访问密码</label><div class="password-row"><input id="password" name="password" type="password" autocomplete="current-password" autofocus required maxlength="512"><button type="button" id="reveal" aria-label="显示密码">显示</button></div>
+<button class="submit" type="submit">进入监控中心</button></form>
+<p class="foot">凭证仅用于当前 CamVault 服务，不会保存在浏览器存储中。</p>
+</section></main><script>const p=document.getElementById('password'),b=document.getElementById('reveal');b.onclick=()=>{{const show=p.type==='password';p.type=show?'text':'password';b.textContent=show?'隐藏':'显示';}};</script></body></html>"""
+        return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+    @app.post("/login")
+    async def login(request: Request) -> Response:
+        if not service.web_password:
+            return RedirectResponse(url="/", status_code=303)
+        body = await request.body()
+        if len(body) > 4096:
+            raise HTTPException(status_code=413, detail="login request is too large")
+        form = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+        provided = form.get("password", [""])[0]
+        if not _constant_time_text_equal(provided, service.web_password):
+            await asyncio.sleep(0.4)
+            return HTMLResponse(
+                _asset_text("login_failed.html"),
+                status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+        destination = form.get("next", ["/"])[0]
+        if not destination.startswith("/") or destination.startswith("//"):
+            destination = "/"
+        response = RedirectResponse(url=destination, status_code=303)
+        response.set_cookie(
+            _SESSION_COOKIE,
+            service.create_browser_session(),
+            max_age=service.config.server.session_hours * 3600,
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="strict",
+            path="/",
+        )
+        return response
+
+    @app.post("/logout", dependencies=[Depends(require_control_auth)])
+    async def logout(request: Request) -> Response:
+        service.revoke_browser_session(request.cookies.get(_SESSION_COOKIE, ""))
+        response = JSONResponse({"status": "logged_out"})
+        response.delete_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="strict")
+        return response
+
+    @app.get("/assets/dashboard.css")
+    async def dashboard_css() -> Response:
+        return Response(
+            _asset_text("dashboard.css"),
+            media_type="text/css",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @app.get("/assets/dashboard.js")
+    async def dashboard_js() -> Response:
+        return Response(
+            _asset_text("dashboard.js"),
+            media_type="text/javascript",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -229,6 +326,68 @@ def create_app(
     @app.get("/api/cameras", dependencies=[Depends(require_playback_auth)])
     async def api_cameras() -> list[dict[str, object]]:
         return [runtime.as_dict() for runtime in service.runtimes.values()]
+
+    @app.get("/api/timeline", dependencies=[Depends(require_playback_auth)])
+    async def api_timeline(start: str, end: str) -> JSONResponse:
+        start_dt = _parse_datetime(start, service.config.storage.timezone)
+        end_dt = _parse_datetime(end, service.config.storage.timezone)
+        assert start_dt is not None and end_dt is not None
+        if start_dt >= end_dt:
+            raise HTTPException(status_code=422, detail="start must be before end")
+        if end_dt - start_dt > timedelta(days=31):
+            raise HTTPException(status_code=422, detail="timeline window cannot exceed 31 days")
+        enabled = [camera for camera in service.config.cameras if camera.enabled]
+        try:
+            results = await asyncio.gather(
+                *(
+                    service.archive_records(camera.id, start=start_dt, end=end_dt)
+                    for camera in enabled
+                )
+            )
+        except StorageBackendError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        cameras: list[dict[str, object]] = []
+        tolerance = max(1.0, service.config.recording.hls_segment_seconds * 2)
+        for camera, records in zip(enabled, results, strict=True):
+            ranges: list[dict[str, object]] = []
+            for record in records:
+                clipped_start = max(record.start, start_dt)
+                clipped_end = min(record.end, end_dt)
+                if clipped_start >= clipped_end:
+                    continue
+                if ranges:
+                    previous_end = datetime.fromisoformat(str(ranges[-1]["end"]))
+                    if (clipped_start - previous_end).total_seconds() <= tolerance:
+                        ranges[-1]["end"] = max(previous_end, clipped_end).isoformat()
+                        ranges[-1]["bytes"] = int(ranges[-1]["bytes"]) + record.size_bytes
+                        ranges[-1]["records"] = int(ranges[-1]["records"]) + 1
+                        continue
+                ranges.append(
+                    {
+                        "start": clipped_start.isoformat(),
+                        "end": clipped_end.isoformat(),
+                        "bytes": record.size_bytes,
+                        "records": 1,
+                    }
+                )
+            cameras.append(
+                {
+                    "id": camera.id,
+                    "name": camera.name or camera.id,
+                    "ranges": ranges,
+                    "record_count": len(records),
+                    "bytes": sum(record.size_bytes for record in records),
+                }
+            )
+        return JSONResponse(
+            {
+                "start": start_dt.isoformat(),
+                "end": end_dt.isoformat(),
+                "archive_chunk_seconds": service.config.storage.archive_chunk_seconds,
+                "cameras": cameras,
+            }
+        )
 
     @app.get("/api/config", dependencies=[Depends(require_control_auth)])
     async def api_config() -> JSONResponse:
@@ -328,14 +487,15 @@ def create_app(
         "/live/{camera_id}/index.m3u8",
         dependencies=[Depends(require_playback_auth)],
     )
-    async def live_playlist(camera_id: str) -> Response:
+    async def live_playlist(camera_id: str, request: Request) -> Response:
         try:
             buffer = service.live_buffer(camera_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="unknown camera") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        encoded_token = quote(service.playback_token, safe="") if service.playback_token else None
+        request_token = request.query_params.get("token")
+        encoded_token = quote(request_token, safe="") if request_token else None
         playlist = buffer.render_playlist(token=encoded_token)
         if not playlist:
             raise HTTPException(
@@ -377,6 +537,7 @@ def create_app(
     )
     async def vod_playlist(
         camera_id: str,
+        request: Request,
         start: str | None = None,
         end: str | None = None,
     ) -> Response:
@@ -394,7 +555,8 @@ def create_app(
             raise HTTPException(status_code=404, detail="no recordings in this time range")
 
         target_duration = max(1, math.ceil(max(record.duration for record in records)))
-        encoded_token = quote(service.playback_token, safe="") if service.playback_token else None
+        request_token = request.query_params.get("token")
+        encoded_token = quote(request_token, safe="") if request_token else None
         token_suffix = f"?token={encoded_token}" if encoded_token else ""
         lines = [
             "#EXTM3U",
@@ -487,8 +649,75 @@ def create_app(
             background=BackgroundTask(remote.close),
         )
 
-    @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_playback_auth)])
-    async def dashboard(request: Request) -> HTMLResponse:
+    @app.get("/", response_class=HTMLResponse)
+    async def dashboard_v2(request: Request) -> Response:
+        if not has_playback_auth(request):
+            if service.web_password:
+                return RedirectResponse(url="/login?next=/", status_code=303)
+            await require_playback_auth(request)
+        token = request.query_params.get("token", "")
+        camera_cards = []
+        for camera in service.config.cameras:
+            state = "已停用" if not camera.enabled else "正在连接"
+            codec_mode = camera.video_codec or service.config.recording.video_codec
+            quality_label = "原码直通" if codec_mode == "copy" else "H.264 主码流"
+            camera_cards.append(
+                f"""<article class="camera-card" data-camera="{camera.id}">
+<div class="camera-head"><div><span class="status-dot" id="dot-{camera.id}"></span>
+<strong>{html.escape(camera.name or camera.id)}</strong></div>
+<span class="camera-state" id="state-{camera.id}">{state}</span></div>
+<div class="video-shell"><video id="video-{camera.id}" controls muted playsinline preload="none"></video>
+<div class="video-placeholder" id="message-{camera.id}">{state}</div><span class="quality-badge">{quality_label}</span></div>
+<div class="camera-foot"><span id="profile-{camera.id}">等待码流信息</span>
+<span id="rate-{camera.id}">0 B / 分钟</span></div></article>"""
+            )
+        bootstrap = _script_json(
+            {
+                "cameras": [
+                    {
+                        "id": c.id,
+                        "name": c.name or c.id,
+                        "enabled": c.enabled,
+                        "codecMode": c.video_codec or service.config.recording.video_codec,
+                    }
+                    for c in service.config.cameras
+                ],
+                "token": token,
+                "csrf": service.csrf_token if has_browser_session(request) else "",
+                "timezone": service.config.storage.timezone,
+                "hasLogin": bool(service.web_password),
+            }
+        )
+        page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark">
+<title>CamVault · 监控中心</title><link rel="stylesheet" href="/assets/dashboard.css?v=6">
+<script defer src="https://cdn.jsdelivr.net/npm/hls.js@1.7.2/dist/hls.min.js"></script>
+<script>window.CAMVAULT_BOOTSTRAP={bootstrap};</script><script defer src="/assets/dashboard.js?v=6"></script></head>
+<body><header class="app-header"><a class="brand" href="/"><span class="brand-mark"><i></i></span><span><b>CamVault</b><small>视频归档系统</small></span></a>
+<nav><button class="nav-item active" data-view="monitor">监控中心</button><button class="nav-item" data-view="system">系统管理</button></nav>
+<div class="header-actions"><span class="health-chip" id="overall"><i></i>正在连接</span><button class="icon-button" id="logout" title="退出登录" hidden>退出</button></div></header>
+<main><section id="monitorView"><div class="section-heading"><div><p class="eyebrow">OVERVIEW</p><h1>监控中心</h1><p>主码流实时预览与连续录像归档</p></div><time id="clock"></time></div>
+<section class="metrics"><article><span>存储使用</span><strong id="storageUsage">—</strong><small id="storageDetail">正在读取容量</small><div class="meter"><i id="storageMeter"></i></div></article>
+<article><span>最近 60 秒写入</span><strong id="writeRate">—</strong><small id="writeBitrate">—</small></article>
+<article><span>归档策略</span><strong id="retention">—</strong><small id="retentionDetail">—</small></article>
+<article><span>内存媒体缓冲</span><strong id="memory">—</strong><small>实时分片与待上传数据</small></article></section>
+<section class="playback-panel"><div class="playback-top"><div class="mode-switch"><button id="modeLive" class="active"><i></i>实时监控</button><button id="modeHistory">历史回放</button></div>
+<p id="playbackNotice">低延迟转发，页面隐藏时自动暂停拉流</p></div>
+<div class="timeline-panel" id="timelinePanel" hidden><div class="timeline-toolbar"><div class="presets"><button data-span="3600000">1 小时</button><button data-span="21600000" class="active">6 小时</button><button data-span="86400000">24 小时</button><button data-span="604800000">7 天</button></div>
+<div class="zoom-tools"><button id="zoomOut" title="缩小时间范围">−</button><button id="zoomIn" title="放大时间范围">＋</button><button id="jumpNow">回到现在</button></div></div>
+<div class="timeline-wrap"><canvas id="timeline" tabindex="0" role="slider" aria-label="录像时间轴"></canvas><div class="timeline-loading" id="timelineLoading">正在载入录像索引</div></div>
+<div class="selection-row"><div><span>回放开始</span><input id="historyStart" type="datetime-local" step="1"></div><div><span>回放结束</span><input id="historyEnd" type="datetime-local" step="1"></div>
+<button id="applyHistory" class="primary">播放所选时段</button><small>拖动框选 · 滚轮缩放 · 按住 Shift 拖动平移</small></div></div></section>
+<section class="camera-grid">{"".join(camera_cards)}</section></section>
+<section id="systemView" hidden><div class="section-heading"><div><p class="eyebrow">SYSTEM</p><h1>系统管理</h1><p>修改配置、检查运行日志与执行归档清理</p></div></div>
+<div class="system-grid"><article class="panel"><div class="panel-head"><div><h2>运行配置</h2><p>保存时自动校验，并保留上一份备份</p></div><button id="reload" class="quiet">重新读取</button></div>
+<textarea id="config" spellcheck="false" aria-label="CamVault TOML configuration"></textarea><div class="panel-actions"><button id="save" class="primary">保存配置</button><span id="notice">修改在重启 CamVault 后生效</span></div></article>
+<article class="panel"><div class="panel-head"><div><h2>运行日志</h2><p>敏感凭证在进入日志前会被脱敏</p></div><button id="refreshLogs" class="quiet">刷新</button></div><pre id="logs">正在读取日志…</pre>
+<div class="panel-actions"><button id="cleanup" class="danger">执行归档清理</button><span>按日期、容量和空余空间策略处理</span></div></article></div></section></main>
+<div class="toast" id="toast" role="status"></div></body></html>"""
+        return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+    async def _legacy_dashboard(request: Request) -> HTMLResponse:
         token = request.query_params.get("token", "")
         cards = []
         token_query = f"?token={quote(token, safe='')}" if token else ""

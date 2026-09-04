@@ -10,7 +10,8 @@ CamVault 是一个面向家庭多摄像头、7×24 运行的 ONVIF/RTSP 录像�
   - `local`：内存聚合后，大文件顺序写 HDD/SSD/NAS 挂载目录；
   - `webdav`：内存聚合后直接流式 PUT 到 AList/WebDAV，不建立本地媒体 spool。
 - 录像按 `摄像头/年/月/日/小时` 分区，包含 SHA-256 JSON 侧车。
-- 提供带 Token 的多摄像头同屏控制台、直播 HLS、连续时间范围回放、配置编辑、诊断日志和状态 API。
+- 提供密码登录的专业多摄像头控制台、主码流直播、可缩放/拖选的连续历史时间轴、配置编辑、诊断日志和状态 API。
+- 控制台展示本地/WebDAV 容量、CamVault 归档量、最近 60 秒写入量及每路码率。
 - 支持保留天数、总容量、最低剩余空间、写失败按最旧录像回收及残留事务清理。
 - 日志先进入有界 RAM 环并批量刷入滚动文件，减少高频小写入。
 
@@ -72,12 +73,14 @@ ffprobe -version
 ### Linux / macOS
 
 ```bash
-unzip camvault-0.4.0.zip
+unzip camvault-0.5.0.zip
 cd camvault
 uv sync
 uv run camvault init
 
-export CAMVAULT_PLAYBACK_TOKEN='换成至少32位随机字符串'
+export CAMVAULT_WEB_PASSWORD='浏览器登录强密码'
+export CAMVAULT_WEBDAV_USERNAME='alist账号'
+export CAMVAULT_WEBDAV_PASSWORD='alist密码'
 export CAMVAULT_LIVING_ROOM_PASSWORD='摄像头密码'
 export CAMVAULT_DOOR_PASSWORD='摄像头密码'
 
@@ -90,12 +93,14 @@ uv run camvault serve -c config.toml
 ### Windows PowerShell
 
 ```powershell
-Expand-Archive .\camvault-0.4.0.zip -DestinationPath .
+Expand-Archive .\camvault-0.5.0.zip -DestinationPath .
 Set-Location .\camvault
 uv sync
 uv run camvault init
 
-$env:CAMVAULT_PLAYBACK_TOKEN = '换成至少32位随机字符串'
+$env:CAMVAULT_WEB_PASSWORD = '浏览器登录强密码'
+$env:CAMVAULT_WEBDAV_USERNAME = 'alist账号'
+$env:CAMVAULT_WEBDAV_PASSWORD = 'alist密码'
 $env:CAMVAULT_LIVING_ROOM_PASSWORD = '摄像头密码'
 $env:CAMVAULT_DOOR_PASSWORD = '摄像头密码'
 
@@ -111,7 +116,7 @@ uv run camvault serve -c .\config.toml
 `server.host` 只支持以下绑定方式，因为 FFmpeg 私有上传端点必须能通过回环地址访问：
 
 - 仅本机播放：`127.0.0.1`、`localhost` 或 `::1`；
-- 局域网播放：`0.0.0.0` 或 `::`，并配置播放 Token；
+- 局域网播放：`0.0.0.0` 或 `::`，并配置网页登录密码或 API Token；
 - 不要只绑定 `192.168.x.x` 一类具体网卡地址；来源限制应放在防火墙/反向代理层。
 
 ## 4. 配置摄像头
@@ -258,6 +263,7 @@ max_connections = 8
 atomic_upload = true
 targeted_scan_max_hours = 168
 max_index_response_mb = 64
+index_cache_entries = 128
 ```
 
 WebDAV URL 禁止内嵌账号密码，避免凭据进入日志或异常信息。
@@ -408,10 +414,10 @@ uv run camvault retention -c config.toml
 假设 CamVault 为 `192.168.1.50:8088`：
 
 ```text
-HTML 控制台（多摄像头同屏实时/同步历史、状态、配置、日志、清理）
-http://192.168.1.50:8088/?token=TOKEN
+HTML 控制台（密码登录、多摄像头主码流、同步历史时间轴、存储状态）
+http://192.168.1.50:8088/
 
-直播
+API/外部播放器直播（可选 API Token）
 http://192.168.1.50:8088/live/living_room/index.m3u8?token=TOKEN
 
 最近一小时历史录像
@@ -423,6 +429,29 @@ http://192.168.1.50:8088/vod/living_room/index.m3u8?start=2026-09-04T20:00:00&en
 状态
 http://192.168.1.50:8088/api/status?token=TOKEN
 ```
+
+浏览器认证默认从 `CAMVAULT_WEB_PASSWORD` 读取，也可写在配置中，或仅在启动时提供：
+
+```toml
+[server]
+web_password_env = "CAMVAULT_WEB_PASSWORD"
+# 或 web_password = "仅适合已限制文件权限的配置；环境变量更安全"
+session_hours = 24
+# API、VLC 或自动化客户端可另设：
+playback_token_env = "CAMVAULT_PLAYBACK_TOKEN"
+```
+
+```bash
+# 推荐：密码不出现在进程列表
+CAMVAULT_UI_SECRET='强密码' uv run camvault serve -c config.toml \
+  --web-password-env CAMVAULT_UI_SECRET
+
+# 也支持 --web-password，但命令行参数可能被同机用户看到。
+```
+
+密码登录后只设置带 `HttpOnly`、`SameSite=Strict` 和有效期的会话 Cookie；密码和会话凭据
+不会写入 URL 或 Web Storage。管理请求还必须带页面生成的 CSRF 头。使用明文 HTTP 时无法
+阻止同网段窃听，跨不可信网络仍须使用 HTTPS、WireGuard 或 Tailscale。
 
 控制台可以原子保存 `config.toml`；保存前会完整校验 TOML 和运行时安全规则，用 SHA-256
 修订号阻止覆盖他人的新改动，并保留一个 `config.toml.bak`。配置保存后需重启服务生效。
@@ -456,19 +485,65 @@ WebDAV 模式下，浏览器不会获得 AList 凭据。CamVault 在服务端代
 ```
 
 历史播放只包含已提交的归档。页面把本地/WebDAV 上按日期、小时保存的分钟分片组合成一条
-连续时间线，并精确跳到用户选择的开始时间；不同 FFmpeg `stream_id` 或明显时间缺口之间会
-插入 `#EXT-X-DISCONTINUITY`。
+连续时间线，并精确跳到用户选择的开始时间；用户可拖动框选、滚轮缩放、按住 Shift 拖动
+平移，也可用 1 小时/6 小时/24 小时/7 天快捷范围。不同 FFmpeg `stream_id` 或明显时间缺口
+之间会插入 `#EXT-X-DISCONTINUITY`。
 
 ### 编码兼容性
 
 - `video_codec="h264"`（默认）：在 CamVault 主机转码，摄像头继续输出 H.265 也能由浏览器播放；
-- `video_codec="copy"`：CPU 最低、无画质损失；摄像头输出 H.265 时多数浏览器不兼容；
+- `video_codec="copy"`：CPU 最低、无重编码画质损失；H.265/HEVC 能否播放取决于浏览器、
+  操作系统与硬件解码支持；
 - `audio_codec="aac"`：把常见 G.711 等转成更兼容的 AAC；
 - `audio_codec="copy"`：最低 CPU，但浏览器可能无声；
 - `audio_codec="none"`：完全不录音。
 
+画质与 CPU 的推荐设置：
+
+```toml
+[recording]
+video_codec = "h264"
+h264_preset = "ultrafast" # 显著降低实时 4K 软件转码 CPU
+h264_crf = 20             # 数字越小画质越高、文件越大
+fps_mode = "passthrough" # 保留摄像头帧率，不复制帧
+ffmpeg_loglevel = "error" # 7x24 默认只记录错误，避免时间戳警告刷日志
+```
+
+CamVault 不会主动缩放视频；最终分辨率就是所选 ONVIF Profile 的分辨率。未指定 Profile 时
+选择摄像头声明的最高分辨率，亦可设置 `profile_index = 0` 锁定主码流。`ultrafast` 会牺牲
+压缩率来换取低 CPU，不会把 4K 降成 360p；容量应以控制台实际“每分钟写入”指标估算。
+
 视频直拷贝只能在关键帧附近切片。摄像头 GOP 很长时，实际分片和直播延迟会大于配置值，
 建议关键帧间隔 1～2 秒。
+
+#### 低性能路由器建议
+
+若观看端支持摄像头的 HEVC 原码，优先使用下列配置。视频不解码、不缩放、不重编码，
+4K 细节原样保留；只有 G.711 等摄像头音频转为 AAC，音频转码占用很小：
+
+```toml
+[recording]
+video_codec = "copy"
+audio_codec = "aac"
+audio_bitrate = "48k"
+fps_mode = "passthrough"
+ffmpeg_loglevel = "error"
+```
+
+在本项目实际部署的 4 核 Intel Celeron N5105 上，两台摄像头主码流（HEVC
+3840×2160@12 fps + HEVC 1280×720@20 fps）同时录像的 45 秒采样如下。CPU 均为占整机
+4 个逻辑核心的比例；写入量是当时画面的滚动 60 秒观测值，场景变化后会波动。
+
+| 模式 | CamVault + 两路 FFmpeg CPU | CamVault + 两路 FFmpeg RSS | 整机 CPU | 最近一分钟写入 |
+|---|---:|---:|---:|---:|
+| H.264 软件转码（ultrafast/CRF 20） | 23.15% | 613.3 MiB | 26.32% | 30.71 MB |
+| HEVC 原码直通 | 0.99% | 91.8 MiB | 5.03% | 2.44 MB |
+| HEVC 原码直通 + 两个实时播放器 | 1.03% | 92.1 MiB | 4.92% | 同上 |
+
+原码直通把录像链路自身 CPU 降低约 95.7%，RSS 降低约 85.0%；两个播放器持续拉取全部
+新分片时，CamVault 仅由整机 0.12% CPU 增至 0.16%。两路 FFmpeg 全程无重启，归档经
+ffprobe 确认为源分辨率和源帧率。若页面提示浏览器不能解码原码，再改用
+`video_codec="h264"`；软件转码兼容面更大，但不适合这类低功耗路由器长期运行。
 
 OpenWrt 软件源中的精简 FFmpeg 可能显式禁用 `h264`/`hevc` 解码器、解析器或 `libx264`。
 这不是摄像头配置问题。把完整静态版 `ffmpeg`、`ffprobe` 放到持久化目录（例如
@@ -487,14 +562,14 @@ audio_codec = "aac"
 
 ## 11. 安全
 
-1. 摄像头密码、WebDAV 密码和播放 Token 使用环境变量，不提交 `.env`/`config.toml`；
+1. 摄像头密码、WebDAV 密码、网页登录密码和 API Token 使用环境变量，不提交 `.env`/`config.toml`；
 2. WebDAV 采用独立 AList 最小权限用户，不使用管理员账号；
 3. AList 同机时只走回环地址；跨机使用 HTTPS 且不要关闭证书验证；
 4. 不把 CamVault 8088 或 AList 5244 直接暴露公网；使用 WireGuard/Tailscale 或 HTTPS 反代；
-5. 默认关闭 Uvicorn access log，避免查询参数 Token 进入普通访问日志；
+5. 默认关闭 Uvicorn access log；浏览器登录不把凭据放在查询参数中；
 6. FFmpeg 通过进程参数接收 RTSP URL，本机管理员仍可能查看凭据；
 7. 录像本身不加密；本地盘使用 BitLocker/FileVault/LUKS，远端依赖网盘加密模型；
-8. 播放 Token 不是 TLS，同网段明文 HTTP 仍可能被窃听。
+8. 密码登录和 API Token 都不是 TLS，同网段明文 HTTP 仍可能被窃听。
 
 详见 [`SECURITY.md`](SECURITY.md)。
 
@@ -505,7 +580,8 @@ audio_codec = "aac"
 - Windows：`deploy/windows/install-task.ps1`
 
 先手工执行 `uv sync --no-dev`，再用 `uv run --no-sync --no-dev` 启动。服务环境中需要同时
-提供摄像头密码、播放 Token，以及 WebDAV 模式下的账号密码。
+提供摄像头密码、网页登录密码，以及 WebDAV 模式下的账号密码；外部播放器/API 如需使用
+再额外配置播放 Token。
 
 本地后端必须给服务账号目标录像目录写权限。WebDAV 后端不需要本地录像目录，但服务日志、
 AList 日志、AList SQLite 和容器日志仍应按“是否允许写 SSD”的目标单独配置。
@@ -564,7 +640,7 @@ uv run camvault camera-check -c config.toml --camera CAMERA_ID [--seconds 3]
 uv run camvault self-test
 uv run camvault retention -c config.toml
 uv run camvault estimate --bitrate-mbps 4 --cameras 4 --days 30
-uv run camvault serve -c config.toml [--log-level info]
+uv run camvault serve -c config.toml [--log-level info] [--web-password-env ENV]
 ```
 
 ## License

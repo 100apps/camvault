@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import secrets
+import shutil
 import time
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
@@ -154,6 +155,7 @@ class LocalStorageBackend(StorageBackend):
     def __init__(self, storage: StorageConfig) -> None:
         self.storage = storage
         self.location = str(storage.root)
+        self._managed_archive_bytes: int | None = None
 
     async def start(self) -> None:
         await asyncio.to_thread(ensure_storage_root, self.storage.root)
@@ -180,7 +182,10 @@ class LocalStorageBackend(StorageBackend):
         )
 
     async def write_batch(self, batch: ArchiveBatch) -> ArchiveRecord:
-        return await asyncio.to_thread(write_archive_batch, batch, self.storage)
+        record = await asyncio.to_thread(write_archive_batch, batch, self.storage)
+        if self._managed_archive_bytes is not None:
+            self._managed_archive_bytes += record.size_bytes
+        return record
 
     async def list_records(
         self,
@@ -210,13 +215,32 @@ class LocalStorageBackend(StorageBackend):
         emergency_min_delete_bytes: int = 0,
         emergency_max_delete_files: int | None = None,
     ) -> RetentionResult:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             apply_retention,
             self.storage,
             now_epoch=now_epoch,
             emergency_min_delete_bytes=emergency_min_delete_bytes,
             emergency_max_delete_files=emergency_max_delete_files,
         )
+        self._managed_archive_bytes = result.remaining_bytes
+        return result
+
+    def status(self) -> dict[str, object]:
+        capacity: dict[str, object] = {
+            "source": "filesystem",
+            "managed_archive_bytes": self._managed_archive_bytes,
+        }
+        try:
+            usage = shutil.disk_usage(self.storage.root)
+        except OSError as exc:
+            capacity["error"] = str(exc)
+        else:
+            capacity |= {
+                "total_bytes": usage.total,
+                "used_bytes": usage.used,
+                "free_bytes": usage.free,
+            }
+        return super().status() | {"capacity": capacity}
 
 
 class WebDAVStorageBackend(StorageBackend):
@@ -243,6 +267,9 @@ class WebDAVStorageBackend(StorageBackend):
         ] = {}
         self._cache_seconds = 30.0
         self._last_media_upload_source_chunks = 0
+        self._managed_archive_bytes: int | None = None
+        self._quota_available_cache: int | None = None
+        self._quota_used_cache: int | None = None
         self._root_parts = tuple(PurePosixPath(self.config.root).parts[1:])
         parsed = urlsplit(self.config.url)
         self._base_path = parsed.path.rstrip("/")
@@ -265,7 +292,7 @@ class WebDAVStorageBackend(StorageBackend):
             ),
             verify=self.config.verify_tls,
             follow_redirects=True,
-            headers={"User-Agent": "CamVault/0.4.0", "Accept-Encoding": "identity"},
+            headers={"User-Agent": "CamVault/0.5.0", "Accept-Encoding": "identity"},
         )
 
     @property
@@ -397,6 +424,8 @@ class WebDAVStorageBackend(StorageBackend):
             raise
 
         self._invalidate_camera(batch.camera_id)
+        if self._managed_archive_bytes is not None:
+            self._managed_archive_bytes += record.size_bytes
         return record
 
     async def list_records(
@@ -432,6 +461,8 @@ class WebDAVStorageBackend(StorageBackend):
             entries = await self._propfind(camera_id, depth="infinity", missing_ok=True)
 
         records = self._records_from_entries(camera_id, entries)
+        while len(self._records_cache) >= self.config.index_cache_entries:
+            self._records_cache.pop(next(iter(self._records_cache)))
         self._records_cache[cache_key] = (time.monotonic(), list(records))
         return _filter_records(records, start=start_utc, end=end_utc, limit=limit)
 
@@ -585,19 +616,33 @@ class WebDAVStorageBackend(StorageBackend):
             if free_bytes is not None:
                 free_bytes += emergency_deleted
 
-        return RetentionResult(
+        result = RetentionResult(
             deleted_files=deleted_files,
             deleted_bytes=deleted_bytes,
             remaining_bytes=max(0, sum(record.size_bytes for record in retained)),
             free_bytes=free_bytes,
         )
+        self._managed_archive_bytes = result.remaining_bytes
+        return result
 
     def status(self) -> dict[str, object]:
+        total_bytes = None
+        if self._quota_available_cache is not None and self._quota_used_cache is not None:
+            total_bytes = self._quota_available_cache + self._quota_used_cache
         return super().status() | {
             "transport": "HTTP WebDAV streaming",
             "atomic_upload": self.config.atomic_upload,
             "local_media_spool": False,
             "credential_source": "environment/config (not exposed)",
+            "capacity": {
+                "source": (
+                    "webdav-quota" if self._quota_available_cache is not None else "camvault-index"
+                ),
+                "total_bytes": total_bytes,
+                "used_bytes": self._quota_used_cache,
+                "free_bytes": self._quota_available_cache,
+                "managed_archive_bytes": self._managed_archive_bytes,
+            },
         }
 
     def _hour_paths(self, camera_id: str, start: datetime, end: datetime) -> list[str]:
@@ -664,8 +709,13 @@ class WebDAVStorageBackend(StorageBackend):
     async def _quota_available_bytes(self) -> int | None:
         entries = await self._propfind("", depth="0", missing_ok=False)
         for entry in entries:
+            if entry.quota_used_bytes is not None:
+                self._quota_used_cache = entry.quota_used_bytes
             if entry.quota_available_bytes is not None:
-                return entry.quota_available_bytes
+                self._quota_available_cache = entry.quota_available_bytes
+                return self._quota_available_cache
+        self._quota_available_cache = None
+        self._quota_used_cache = None
         return None
 
     def _invalidate_camera(self, camera_id: str) -> None:

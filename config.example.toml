@@ -1,9 +1,11 @@
 [server]
-# For LAN playback use 0.0.0.0 and set CAMVAULT_PLAYBACK_TOKEN.
+# For LAN playback use 0.0.0.0 and set CAMVAULT_WEB_PASSWORD.
 # Do not bind only to a concrete LAN IP: FFmpeg ingest intentionally uses loopback.
 host = "0.0.0.0"
 port = 8088
 playback_token_env = "CAMVAULT_PLAYBACK_TOKEN"
+web_password_env = "CAMVAULT_WEB_PASSWORD"
+session_hours = 24
 allow_unauthenticated_lan = false
 access_log = false
 
@@ -21,7 +23,7 @@ backup_count = 5
 [storage]
 # "local": large sequential files on a local HDD/SSD/NAS mount.
 # "webdav": stream archive batches from RAM to AList/WebDAV; no local media spool.
-backend = "local"
+backend = "webdav"
 
 # Used only by backend="local". Prefer a surveillance HDD/NAS mount.
 # A relative path is resolved beside this config file.
@@ -33,7 +35,7 @@ max_buffer_mb_per_camera = 128
 retention_days = 30
 max_storage_gb = 0
 # For WebDAV, set this to 0 unless the server exposes DAV:quota-available-bytes.
-min_free_gb = 10
+min_free_gb = 0
 retention_check_seconds = 3600
 partial_max_age_hours = 24
 # On the first archive write failure, delete the oldest managed recordings and retry
@@ -64,6 +66,7 @@ atomic_upload = true
 # VOD requests within this range scan only the overlapping hour directories.
 targeted_scan_max_hours = 168
 max_index_response_mb = 64
+index_cache_entries = 128
 
 [recording]
 ffmpeg_path = "ffmpeg"
@@ -86,8 +89,12 @@ video_codec = "h264"
 # AAC improves browser compatibility; set copy to avoid even audio transcoding.
 audio_codec = "aac"
 audio_bitrate = "48k"
-h264_preset = "veryfast"
-ffmpeg_loglevel = "warning"
+h264_preset = "ultrafast"
+h264_crf = 20
+fps_mode = "passthrough"
+# Error-only avoids noisy camera timestamp warnings during 7x24 operation.
+# Temporarily use "warning" or "info" only while troubleshooting.
+ffmpeg_loglevel = "error"
 
 [[cameras]]
 id = "living_room"

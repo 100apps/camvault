@@ -22,6 +22,9 @@ def test_camera_command_uses_http_put_without_temporary_segment_files() -> None:
     assert "http://127.0.0.1:8088/_ingest/front/" in joined
     assert "segment_abc_" in joined
     assert ".partial" not in joined
+    assert "-preset ultrafast" in joined
+    assert "-crf 20" in joined
+    assert "-fps_mode:v passthrough" in joined
     redacted = redacted_command(command, secrets_to_hide=("ingest-secret",))
     assert "password" not in redacted
     assert "ingest-secret" not in redacted

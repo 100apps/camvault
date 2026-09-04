@@ -178,6 +178,7 @@ class LogManager:
 def config_secrets(config: AppConfig) -> tuple[str, ...]:
     values = [
         config.server.resolved_playback_token(),
+        config.server.resolved_web_password(),
         config.storage.webdav.resolved_password(),
     ]
     for camera in config.cameras:

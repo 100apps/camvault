@@ -256,6 +256,14 @@ def command_doctor(args: argparse.Namespace) -> int:
                 "detail": "server binds only to loopback",
             }
         )
+    elif config.server.resolved_web_password():
+        findings.append(
+            {
+                "check": "playback exposure",
+                "result": "PASS",
+                "detail": "LAN bind protected by browser password",
+            }
+        )
     elif config.server.resolved_playback_token():
         findings.append(
             {
@@ -428,7 +436,19 @@ def command_serve(args: argparse.Namespace) -> int:
     # Keep startup failures visible before the full buffered logger can be configured.
     _configure_logging(args.log_level)
     try:
-        config = load_config(args.config)
+        config = load_config(args.config, validate_runtime=False)
+        if args.web_password is not None:
+            config.server.web_password = args.web_password
+            config.server.web_password_env = None
+        elif args.web_password_env is not None:
+            value = os.getenv(args.web_password_env)
+            if not value:
+                raise ValueError(
+                    f"web password environment variable {args.web_password_env} is not set"
+                )
+            config.server.web_password = value
+            config.server.web_password_env = None
+        config.validate_runtime_security()
     except (OSError, ValueError) as exc:
         print(f"Cannot load configuration: {exc}", file=sys.stderr)
         return 2
@@ -527,6 +547,15 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("-c", "--config", default="config.toml")
     serve_parser.add_argument(
         "--log-level", choices=["debug", "info", "warning", "error"], default="info"
+    )
+    password_group = serve_parser.add_mutually_exclusive_group()
+    password_group.add_argument(
+        "--web-password",
+        help="browser login password (visible in process listings; prefer --web-password-env)",
+    )
+    password_group.add_argument(
+        "--web-password-env",
+        help="read the browser login password from this environment variable",
     )
     serve_parser.set_defaults(func=command_serve)
 

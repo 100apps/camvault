@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 — 2026-09-04
+
+- Switched browser playback to the highest-resolution camera profile and added explicit
+  low-CPU H.264 controls (`ultrafast`, CRF 20 and passthrough frame timing) so 4K input is
+  not silently reduced or expanded into duplicate frames.
+- Rebuilt the dashboard with password sessions, CSRF-protected controls, storage capacity,
+  rolling per-camera write volume and a zoomable, draggable multi-camera archive timeline.
+- Made the generated deployment configuration WebDAV-first while retaining the local
+  backend, added a startup password option and exposed WebDAV quota/managed archive metrics.
+- Added an error-only 7x24 FFmpeg logging default, original-stream badges and actionable
+  browser codec errors. Documented real N5105 benchmarks showing HEVC passthrough at about
+  1% whole-machine CPU for two camera feeds, versus about 23% for software H.264 encoding.
+
 ## 0.4.0 — 2026-09-04
 
 - Added configurable day/size/free-space limits and bounded oldest-first emergency

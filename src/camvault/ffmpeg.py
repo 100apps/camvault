@@ -162,6 +162,8 @@ def build_camera_command(
             "libx264",
             "-preset",
             recording.h264_preset,
+            "-crf",
+            str(recording.h264_crf),
             "-tune",
             "zerolatency",
             "-pix_fmt",
@@ -186,6 +188,8 @@ def build_camera_command(
         "2048",
         "-avoid_negative_ts",
         "make_zero",
+        "-fps_mode:v",
+        recording.fps_mode,
         *recording.extra_output_args,
     ]
     args += _hls_output_args(

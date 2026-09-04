@@ -156,6 +156,7 @@ class MemoryWebDAV:
                 resource = "<d:collection/>" if is_dir else ""
                 quota = (
                     f"<d:quota-available-bytes>{self.quota_available}</d:quota-available-bytes>"
+                    f"<d:quota-used-bytes>{sum(map(len, self.files.values()))}</d:quota-used-bytes>"
                     if item_path == "/dav/Cloud/CamVault"
                     else ""
                 )
@@ -346,6 +347,10 @@ async def test_webdav_retention_deletes_old_media_and_sidecar(tmp_path: Path) ->
         assert result.deleted_bytes == 3
         assert result.remaining_bytes == 3
         assert result.free_bytes == server.quota_available
+        capacity = backend.status()["capacity"]
+        assert capacity["source"] == "webdav-quota"
+        assert capacity["managed_archive_bytes"] == 3
+        assert capacity["total_bytes"] >= server.quota_available
         all_paths = set(server.files)
         old_remote = f"/dav/Cloud/CamVault/front/{old.relative_path}"
         new_remote = f"/dav/Cloud/CamVault/front/{new.relative_path}"

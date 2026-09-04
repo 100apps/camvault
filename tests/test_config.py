@@ -69,8 +69,22 @@ def test_lan_bind_requires_authentication() -> None:
         ),
         cameras=[CameraConfig(id="one", rtsp_url="rtsp://192.0.2.1/x")],
     )
-    with pytest.raises(ValueError, match="no playback token"):
+    with pytest.raises(ValueError, match="no authentication"):
         config.validate_runtime_security()
+
+
+def test_lan_bind_accepts_browser_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CAMVAULT_WEB_PASSWORD", "browser-secret")
+    config = AppConfig(
+        server=ServerConfig(
+            host="0.0.0.0",
+            playback_token=None,
+            playback_token_env=None,
+        ),
+        cameras=[CameraConfig(id="one", rtsp_url="rtsp://192.0.2.1/x")],
+    )
+    config.validate_runtime_security()
+    assert config.server.resolved_web_password() == "browser-secret"
 
 
 def test_invalid_timezone_is_rejected() -> None:

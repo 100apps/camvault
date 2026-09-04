@@ -62,11 +62,17 @@ class CameraSupervisor:
                 self._set_state("resolving", "resolving ONVIF/RTSP stream")
                 rtsp_url, profile = await resolve_camera_rtsp(self.camera)
                 self.runtime.resolved_stream = redact_url(rtsp_url)
-                self.runtime.resolved_profile = (
-                    f"{profile.name} ({profile.width or '?'}x{profile.height or '?'})"
-                    if profile
-                    else "direct RTSP"
-                )
+                if profile and profile.width and profile.height:
+                    self.runtime.resolved_profile = (
+                        f"{profile.name} ({profile.width}x{profile.height})"
+                    )
+                elif profile:
+                    # Some inexpensive ONVIF implementations advertise zero dimensions
+                    # even though the RTSP stream is valid. Avoid presenting "?x?" as a
+                    # quality problem in the dashboard.
+                    self.runtime.resolved_profile = f"{profile.name} · 主码流"
+                else:
+                    self.runtime.resolved_profile = "direct RTSP"
                 command = build_camera_command(
                     camera=self.camera,
                     recording=recording,

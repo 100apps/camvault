@@ -99,6 +99,20 @@ async def test_ingest_auth_live_and_vod_playback(tmp_path: Path) -> None:
             payload = status.json()
             assert payload["archive_buffer_bytes"] == 0
             assert payload["bounded_media_memory_bytes"] >= 6
+            assert payload["write_bytes_last_minute"] == 6
+            assert payload["storage"]["capacity"]["total_bytes"] > 0
+
+            records = await service.archive_records("front")
+            timeline = await client.get(
+                "/api/timeline",
+                params={
+                    "start": (records[0].start - timedelta(seconds=1)).isoformat(),
+                    "end": (records[0].end + timedelta(seconds=1)).isoformat(),
+                    "token": "play-token",
+                },
+            )
+            assert timeline.status_code == 200
+            assert timeline.json()["cameras"][0]["ranges"][0]["records"] == 1
     finally:
         await service.stop()
 
@@ -189,14 +203,66 @@ rtsp_url = "rtsp://127.0.0.1/unused"
 
         dashboard = await client.get("/", params={"token": "control-token"})
         assert dashboard.status_code == 200
-        assert "CamVault 控制台" in dashboard.text
-        assert "立即清理旧录像" in dashboard.text
+        assert "CamVault · 监控中心" in dashboard.text
+        assert "执行归档清理" in dashboard.text
         assert 'data-camera="front"' in dashboard.text
         assert 'id="video-front"' in dashboard.text
-        assert "全部实时" in dashboard.text
+        assert "实时监控" in dashboard.text
         assert "历史回放" in dashboard.text
         assert "hls.js@1.7.2" in dashboard.text
-        assert r".join('\n')" in dashboard.text
+        assert "/assets/dashboard.js?v=6" in dashboard.text
+        assert '"codecMode": "h264"' in dashboard.text
+        assert "H.264 主码流" in dashboard.text
+
+
+@pytest.mark.asyncio
+async def test_browser_password_login_session_and_csrf(tmp_path: Path) -> None:
+    config = AppConfig(
+        server=ServerConfig(
+            host="0.0.0.0",
+            playback_token=None,
+            playback_token_env=None,
+            web_password="correct horse battery staple",
+            web_password_env=None,
+        ),
+        storage=StorageConfig(root=tmp_path, min_free_gb=0),
+        recording=RecordingConfig(max_ingest_segment_mb=8),
+        cameras=[CameraConfig(id="front", rtsp_url="rtsp://127.0.0.1/unused")],
+    )
+    service = CamVaultService(config)
+    app = create_app(service, manage_service=False)
+    transport = httpx.ASGITransport(app=app, client=("192.168.1.20", 40000))
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://camvault", follow_redirects=False
+    ) as client:
+        redirect = await client.get("/")
+        assert redirect.status_code == 303
+        assert redirect.headers["location"].startswith("/login")
+
+        wrong = await client.post("/login", data={"password": "wrong", "next": "/"})
+        assert wrong.status_code == 401
+        assert "camvault_session" not in wrong.cookies
+
+        login = await client.post(
+            "/login", data={"password": "correct horse battery staple", "next": "/"}
+        )
+        assert login.status_code == 303
+        cookie = login.headers["set-cookie"]
+        assert "HttpOnly" in cookie
+        assert "SameSite=strict" in cookie
+
+        dashboard = await client.get("/")
+        assert dashboard.status_code == 200
+        assert "监控中心" in dashboard.text
+        assert (await client.get("/api/status")).status_code == 200
+        assert (await client.get("/api/config")).status_code == 403
+        assert (
+            await client.get("/api/config", headers={"X-CamVault-CSRF": service.csrf_token})
+        ).status_code == 409
+
+        logout = await client.post("/logout", headers={"X-CamVault-CSRF": service.csrf_token})
+        assert logout.status_code == 200
+        assert (await client.get("/")).status_code == 303
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,12 @@ class ServerConfig(BaseModel):
     port: int = Field(default=8088, ge=1, le=65535)
     playback_token: str | None = None
     playback_token_env: str | None = "CAMVAULT_PLAYBACK_TOKEN"
+    # Browser users authenticate with a normal password. API clients can continue to use
+    # playback_token; keeping the two mechanisms separate avoids putting a reusable
+    # browser password in media URLs.
+    web_password: str | None = None
+    web_password_env: str | None = "CAMVAULT_WEB_PASSWORD"
+    session_hours: int = Field(default=24, ge=1, le=720)
     allow_unauthenticated_lan: bool = False
     access_log: bool = False
 
@@ -28,6 +34,13 @@ class ServerConfig(BaseModel):
             if value:
                 return value
         return self.playback_token or None
+
+    def resolved_web_password(self) -> str | None:
+        if self.web_password_env:
+            value = os.getenv(self.web_password_env)
+            if value:
+                return value
+        return self.web_password or None
 
     def is_loopback_bind(self) -> bool:
         host = self.host.strip().strip("[]")
@@ -75,6 +88,7 @@ class WebDAVConfig(BaseModel):
     atomic_upload: bool = True
     targeted_scan_max_hours: int = Field(default=168, ge=1, le=24 * 365)
     max_index_response_mb: int = Field(default=64, ge=1, le=1024)
+    index_cache_entries: int = Field(default=128, ge=8, le=4096)
 
     @field_validator("url")
     @classmethod
@@ -166,8 +180,17 @@ class RecordingConfig(BaseModel):
     audio_codec: Literal["copy", "aac", "none"] = "aac"
     # 48 kbit/s avoids FFmpeg clamping for common 8 kHz mono G.711 camera audio.
     audio_bitrate: str = "48k"
-    h264_preset: str = "veryfast"
-    ffmpeg_loglevel: Literal["quiet", "panic", "fatal", "error", "warning", "info"] = "warning"
+    # ultrafast trades some archive size for much lower CPU consumption. CRF 20 retains
+    # substantially more source detail than FFmpeg's implicit CRF 23 default.
+    h264_preset: str = "ultrafast"
+    h264_crf: int = Field(default=20, ge=0, le=51)
+    # Camera timestamps must not be expanded into duplicated frames. This matters most
+    # for low-frame-rate 4K cameras where duplication wastes both CPU and WebDAV space.
+    fps_mode: Literal["passthrough", "vfr", "cfr"] = "passthrough"
+    # Error-only output avoids repeated timestamp warnings becoming a CPU and disk-log
+    # workload on small always-on routers. Operators can temporarily select warning/info
+    # when diagnosing a camera.
+    ffmpeg_loglevel: Literal["quiet", "panic", "fatal", "error", "warning", "info"] = "error"
     extra_input_args: list[str] = Field(default_factory=list)
     extra_output_args: list[str] = Field(default_factory=list)
 
@@ -309,11 +332,14 @@ class AppConfig(BaseModel):
             not self.server.is_loopback_bind()
             and not self.server.allow_unauthenticated_lan
             and not self.server.resolved_playback_token()
+            and not self.server.resolved_web_password()
         ):
-            env_hint = self.server.playback_token_env or "CAMVAULT_PLAYBACK_TOKEN"
+            token_hint = self.server.playback_token_env or "CAMVAULT_PLAYBACK_TOKEN"
+            password_hint = self.server.web_password_env or "CAMVAULT_WEB_PASSWORD"
             raise ValueError(
                 f"server.host={self.server.host!r} accepts non-local connections, but no "
-                f"playback token is set. Set {env_hint}, configure server.playback_token, "
+                f"authentication is set. Set {password_hint} for browser login, set "
+                f"{token_hint} for API access, "
                 "or explicitly set allow_unauthenticated_lan=true."
             )
         if self.storage.backend == "webdav":
@@ -327,7 +353,9 @@ class AppConfig(BaseModel):
                 )
 
 
-def parse_config_text(text: str, *, base_dir: str | Path) -> AppConfig:
+def parse_config_text(
+    text: str, *, base_dir: str | Path, validate_runtime: bool = True
+) -> AppConfig:
     """Validate TOML text and resolve paths relative to its configuration directory."""
 
     raw = tomllib.loads(text)
@@ -342,10 +370,15 @@ def parse_config_text(text: str, *, base_dir: str | Path) -> AppConfig:
             config.logging.file = (config_dir / config.logging.file).resolve()
         else:
             config.logging.file = config.logging.file.expanduser().resolve()
-    config.validate_runtime_security()
+    if validate_runtime:
+        config.validate_runtime_security()
     return config
 
 
-def load_config(path: str | Path) -> AppConfig:
+def load_config(path: str | Path, *, validate_runtime: bool = True) -> AppConfig:
     config_path = Path(path).expanduser().resolve()
-    return parse_config_text(config_path.read_text(encoding="utf-8"), base_dir=config_path.parent)
+    return parse_config_text(
+        config_path.read_text(encoding="utf-8"),
+        base_dir=config_path.parent,
+        validate_runtime=validate_runtime,
+    )

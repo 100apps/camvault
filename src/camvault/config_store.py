@@ -31,9 +31,18 @@ def _revision(payload: bytes) -> str:
 class ConfigStore:
     """Read, validate and atomically update one CamVault TOML file."""
 
-    def __init__(self, path: str | Path, *, max_bytes: int = 1024 * 1024) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        max_bytes: int = 1024 * 1024,
+        runtime_web_password: str | None = None,
+        runtime_playback_token: str | None = None,
+    ) -> None:
         self.path = Path(path).expanduser().resolve()
         self.max_bytes = max_bytes
+        self.runtime_web_password = runtime_web_password
+        self.runtime_playback_token = runtime_playback_token
         self._lock = threading.RLock()
 
     @property
@@ -65,7 +74,18 @@ class ConfigStore:
         if "\x00" in content:
             raise ConfigStoreError("configuration contains a NUL byte")
         try:
-            return parse_config_text(content, base_dir=self.path.parent)
+            config = parse_config_text(content, base_dir=self.path.parent, validate_runtime=False)
+            # A password/token supplied only to `camvault serve` is intentionally absent
+            # from the file. Apply it solely for validation so the web editor can still
+            # save other settings without persisting that secret.
+            if self.runtime_web_password:
+                config.server.web_password = self.runtime_web_password
+                config.server.web_password_env = None
+            if self.runtime_playback_token:
+                config.server.playback_token = self.runtime_playback_token
+                config.server.playback_token_env = None
+            config.validate_runtime_security()
+            return config
         except (OSError, ValueError) as exc:
             raise ConfigStoreError(f"invalid configuration: {exc}") from exc
 

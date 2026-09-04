@@ -61,3 +61,21 @@ def test_config_write_requires_revision(tmp_path: Path) -> None:
     path.write_text(_config(), encoding="utf-8")
     with pytest.raises(ConfigConflictError, match="revision is required"):
         ConfigStore(path).write(_config("./new"), expected_revision=None)
+
+
+def test_runtime_password_allows_safe_edit_without_persisting_secret(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    content = (
+        '[server]\nhost = "0.0.0.0"\nplayback_token_env = ""\nweb_password_env = ""\n\n' + _config()
+    )
+    path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(ConfigStoreError, match="no authentication"):
+        ConfigStore(path).validate(content)
+
+    store = ConfigStore(path, runtime_web_password="runtime-only-secret")
+    parsed = store.validate(content)
+    assert parsed.server.resolved_web_password() == "runtime-only-secret"
+    saved = store.write(content, expected_revision=store.read().revision)
+    assert saved.content == content
+    assert "runtime-only-secret" not in path.read_text(encoding="utf-8")

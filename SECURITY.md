@@ -4,7 +4,7 @@ CamVault is intended for a trusted home LAN or a private overlay network.
 
 ## Secrets
 
-- Prefer `password_env`, `username_env`, `rtsp_url_env`, `playback_token_env`, and the WebDAV credential environment variables.
+- Prefer `password_env`, `username_env`, `rtsp_url_env`, `web_password_env`, `playback_token_env`, and the WebDAV credential environment variables.
 - Do not commit `config.toml`, `.env`, shell history containing secrets, or service files with plaintext credentials.
 - WebDAV URLs containing user information are rejected. CamVault keeps AList credentials server-side and never embeds them in browser playlists.
 - RTSP credentials are passed to FFmpeg in its process arguments. Logs redact them, but a privileged local account may inspect process arguments.
@@ -13,7 +13,8 @@ CamVault is intended for a trusted home LAN or a private overlay network.
 ## Network exposure
 
 - Ingest accepts only loopback clients and requires a random process-local secret. For LAN playback, bind `0.0.0.0` or `::`; binding only a concrete LAN IP is intentionally rejected so the private ingest route cannot leave loopback.
-- Playback endpoints require a token when bound to a non-loopback address, unless the operator explicitly overrides the safeguard.
+- Playback endpoints require a browser password or API token when bound to a non-loopback address, unless the operator explicitly overrides the safeguard.
+- Browser sessions use an expiring HttpOnly, SameSite=Strict cookie; state-changing and control-console requests also require a per-process CSRF token.
 - The built-in server does not terminate TLS. Do not expose it or AList WebDAV directly to the public Internet.
 - Prefer WireGuard/Tailscale. Otherwise put services behind a maintained HTTPS reverse proxy with authentication and rate limits.
 - Non-Safari browser playback loads pinned hls.js from jsDelivr and sends no referrer. Use Safari native HLS or VLC/IINA when the playback machine must make no CDN request.

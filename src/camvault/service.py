@@ -4,6 +4,8 @@ import asyncio
 import logging
 import re
 import secrets
+import time
+from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -81,6 +83,13 @@ class CamVaultService:
         )
         self.ingest_secret = secrets.token_urlsafe(32)
         self.playback_token = config.server.resolved_playback_token()
+        self.web_password = config.server.resolved_web_password()
+        # Server-side random sessions keep the password out of URLs and browser storage.
+        self.browser_sessions: dict[str, float] = {}
+        self.csrf_token = secrets.token_urlsafe(32)
+        self._ingest_samples: dict[str, deque[tuple[float, int]]] = {
+            camera_id: deque() for camera_id in enabled_ids
+        }
         self._last_stream_ids: dict[str, str] = {}
         self.supervisors = SupervisorManager(
             config=config,
@@ -93,7 +102,15 @@ class CamVaultService:
         self._retention_wakeup = asyncio.Event()
         self._started = False
         self._supervisors_started = False
-        self.config_store = ConfigStore(config_path) if config_path is not None else None
+        self.config_store = (
+            ConfigStore(
+                config_path,
+                runtime_web_password=self.web_password,
+                runtime_playback_token=self.playback_token,
+            )
+            if config_path is not None
+            else None
+        )
         self.recent_logs = recent_logs
         self.last_retention: RetentionResult | None = None
         self.last_retention_started_at: datetime | None = None
@@ -187,6 +204,10 @@ class CamVaultService:
         runtime.detail = "receiving media"
         runtime.last_error = None
         runtime.touch()
+        now = time.monotonic()
+        samples = self._ingest_samples[camera_id]
+        samples.append((now, len(payload)))
+        self._prune_ingest_samples(samples, now)
         await self.archive_manager.add(camera_id, segment)
         return "segment"
 
@@ -244,6 +265,35 @@ class CamVaultService:
 
     async def flush_archives(self) -> None:
         await self.archive_manager.flush_all()
+
+    def create_browser_session(self) -> str:
+        now = time.monotonic()
+        self._prune_browser_sessions(now)
+        while len(self.browser_sessions) >= 64:
+            oldest = min(self.browser_sessions.items(), key=lambda item: item[1])[0]
+            self.browser_sessions.pop(oldest, None)
+        token = secrets.token_urlsafe(32)
+        self.browser_sessions[token] = now + self.config.server.session_hours * 3600
+        return token
+
+    def valid_browser_session(self, supplied: str) -> bool:
+        if not supplied:
+            return False
+        expiry = self.browser_sessions.get(supplied)
+        if expiry is None:
+            return False
+        if time.monotonic() >= expiry:
+            self.browser_sessions.pop(supplied, None)
+            return False
+        return True
+
+    def revoke_browser_session(self, supplied: str) -> None:
+        self.browser_sessions.pop(supplied, None)
+
+    def _prune_browser_sessions(self, now: float) -> None:
+        for token, expiry in list(self.browser_sessions.items()):
+            if now >= expiry:
+                self.browser_sessions.pop(token, None)
 
     async def read_config(self) -> ConfigSnapshot:
         if self.config_store is None:
@@ -309,6 +359,23 @@ class CamVaultService:
         live_bytes = sum(buffer.total_bytes for buffer in self.buffers.values())
         archive_buffer_bytes = self.archive_manager.memory_bytes()
         storage_status = self.storage_backend.status()
+        now = time.monotonic()
+        camera_statuses = []
+        write_bytes_last_minute = 0
+        for runtime in self.runtimes.values():
+            samples = self._ingest_samples.get(runtime.camera_id)
+            recent_bytes = 0
+            if samples is not None:
+                self._prune_ingest_samples(samples, now)
+                recent_bytes = sum(size for _timestamp, size in samples)
+            write_bytes_last_minute += recent_bytes
+            camera_statuses.append(
+                runtime.as_dict()
+                | {
+                    "write_bytes_last_minute": recent_bytes,
+                    "write_mbps_last_minute": round(recent_bytes * 8 / 60 / 1_000_000, 3),
+                }
+            )
         return {
             "status": "ok",
             "storage": storage_status,
@@ -319,6 +386,8 @@ class CamVaultService:
             "live_memory_bytes": live_bytes,
             "archive_buffer_bytes": archive_buffer_bytes,
             "bounded_media_memory_bytes": live_bytes + archive_buffer_bytes,
+            "write_bytes_last_minute": write_bytes_last_minute,
+            "write_mbps_last_minute": round(write_bytes_last_minute * 8 / 60 / 1_000_000, 3),
             "retention": {
                 "policy": {
                     "retention_days": self.config.storage.retention_days,
@@ -351,8 +420,14 @@ class CamVaultService:
                 ),
                 "free_bytes": self.last_retention.free_bytes if self.last_retention else None,
             },
-            "cameras": [runtime.as_dict() for runtime in self.runtimes.values()],
+            "cameras": camera_statuses,
         }
+
+    @staticmethod
+    def _prune_ingest_samples(samples: deque[tuple[float, int]], now: float) -> None:
+        cutoff = now - 60.0
+        while samples and samples[0][0] < cutoff:
+            samples.popleft()
 
     async def _on_stream_end(self, camera_id: str) -> None:
         # Seal a short tail immediately. It is enqueued but not synchronously persisted, so
