@@ -10,7 +10,7 @@ CamVault 是一个面向家庭多摄像头、7×24 运行的 ONVIF/RTSP 录像�
   - `local`：内存聚合后，大文件顺序写 HDD/SSD/NAS 挂载目录；
   - `webdav`：内存聚合后直接流式 PUT 到 AList/WebDAV，不建立本地媒体 spool。
 - 录像按 `摄像头/年/月/日/小时` 分区，包含 SHA-256 和分片音量索引 JSON 侧车。
-- 提供密码登录的专业多摄像头控制台、主码流直播、倍速回放、带声音活动标记的连续历史时间轴、配置编辑、诊断日志和状态 API。
+- 提供密码登录的专业多摄像头控制台、主码流直播、倍速回放、按时间与摄像头导出 MP4、带声音活动标记的连续历史时间轴、配置编辑、诊断日志和状态 API。
 - 控制台展示本地/WebDAV 容量、CamVault 归档量、最近 60 秒写入量及每路码率。
 - 支持保留天数、总容量、最低剩余空间、写失败按最旧录像回收及残留事务清理。
 - 日志先进入有界 RAM 环并批量刷入滚动文件，减少高频小写入。
@@ -73,7 +73,7 @@ ffprobe -version
 ### Linux / macOS
 
 ```bash
-unzip camvault-0.6.0.zip
+unzip camvault-0.7.0.zip
 cd camvault
 uv sync
 uv run camvault init
@@ -93,7 +93,7 @@ uv run camvault serve -c config.toml
 ### Windows PowerShell
 
 ```powershell
-Expand-Archive .\camvault-0.6.0.zip -DestinationPath .
+Expand-Archive .\camvault-0.7.0.zip -DestinationPath .
 Set-Location .\camvault
 uv sync
 uv run camvault init
@@ -505,6 +505,11 @@ audio_activity_threshold_db = -35 # 越接近 0，越不容易被环境底噪触
 
 `audio_codec="copy"` 保持完全直拷贝，CamVault 不会为索引强制解码，此时不生成声音索引；
 也可用 `audio_index_enabled=false` 完全关闭。
+
+在时间轴选择开始和结束时间后，可选择一路摄像头并点击“导出 MP4”。导出链路顺序读取
+本地或 WebDAV 归档，通过 FFmpeg `-c copy` 重新封装为流式 MP4：不重编码、不降低画质、
+不创建临时视频文件。为避免低性能路由器被多个大任务占满，同一时间只允许一个导出，
+单个文件最长 24 小时；起点按视频最近关键帧对齐。
 
 ### 编码兼容性
 

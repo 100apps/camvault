@@ -4,10 +4,12 @@ import asyncio
 import html
 import ipaddress
 import json
+import logging
 import math
 import re
 import secrets
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
 from urllib.parse import parse_qs, quote
@@ -27,12 +29,15 @@ from starlette.datastructures import MutableHeaders
 from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from camvault.archive import ArchiveRecord
 from camvault.config_store import ConfigConflictError, ConfigStoreError
+from camvault.ffmpeg import build_download_command
 from camvault.service import CamVaultService
 from camvault.storage import StorageBackendError
 
 _FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,180}$")
 _SESSION_COOKIE = "camvault_session"
+logger = logging.getLogger(__name__)
 
 
 def _asset_text(name: str) -> str:
@@ -104,6 +109,94 @@ def _parse_datetime(value: str | None, timezone_name: str) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+async def _feed_download_input(
+    service: CamVaultService,
+    process: asyncio.subprocess.Process,
+    records: list[ArchiveRecord],
+) -> None:
+    writer = process.stdin
+    if writer is None:
+        return
+    try:
+        for record in records:
+            local_path = service.local_recording_path(record.camera_id, record.relative_path)
+            if local_path is not None:
+                file = await asyncio.to_thread(local_path.open, "rb")
+                try:
+                    while chunk := await asyncio.to_thread(file.read, 1024 * 1024):
+                        writer.write(chunk)
+                        await writer.drain()
+                finally:
+                    await asyncio.to_thread(file.close)
+                continue
+
+            remote = await service.open_remote_recording(
+                record.camera_id, record.relative_path, None
+            )
+            if remote is None:
+                raise RuntimeError("archive backend did not provide a readable recording")
+            try:
+                async for chunk in remote.iter_bytes():
+                    writer.write(chunk)
+                    await writer.drain()
+            finally:
+                await remote.close()
+    except (BrokenPipeError, ConnectionResetError):
+        # FFmpeg closes its input once the selected duration has been emitted.
+        pass
+    finally:
+        writer.close()
+        with suppress(BrokenPipeError, ConnectionResetError):
+            await writer.wait_closed()
+
+
+async def _read_process_stderr(process: asyncio.subprocess.Process) -> str:
+    if process.stderr is None:
+        return ""
+    tail = bytearray()
+    while chunk := await process.stderr.read(4096):
+        tail.extend(chunk)
+        del tail[:-8192]
+    return tail.decode("utf-8", errors="replace").strip()
+
+
+async def _stream_download(
+    service: CamVaultService,
+    process: asyncio.subprocess.Process,
+    records: list[ArchiveRecord],
+    slot: asyncio.Semaphore,
+) -> AsyncIterator[bytes]:
+    feeder = asyncio.create_task(
+        _feed_download_input(service, process, records), name="download-input"
+    )
+    stderr_reader = asyncio.create_task(_read_process_stderr(process), name="download-stderr")
+    try:
+        assert process.stdout is not None
+        while chunk := await process.stdout.read(256 * 1024):
+            yield chunk
+        exit_code = await process.wait()
+        feed_result = await asyncio.gather(feeder, return_exceptions=True)
+        stderr = await stderr_reader
+        if feed_result and isinstance(feed_result[0], Exception):
+            logger.error("archive download input failed: %s", feed_result[0])
+        if exit_code != 0:
+            logger.error("archive download FFmpeg exited with code %d: %s", exit_code, stderr)
+    finally:
+        if not feeder.done():
+            feeder.cancel()
+        if process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.terminate()
+            with suppress(TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=5)
+        if process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+        await asyncio.gather(feeder, stderr_reader, return_exceptions=True)
+        slot.release()
+
+
 def create_app(
     service: CamVaultService,
     *,
@@ -111,6 +204,7 @@ def create_app(
     start_recorders: bool = True,
 ) -> FastAPI:
     delayed_start = None
+    download_slot = asyncio.Semaphore(1)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -133,7 +227,7 @@ def create_app(
 
     app = FastAPI(
         title="CamVault",
-        version="0.6.0",
+        version="0.7.0",
         description="RAM-buffered ONVIF/RTSP recorder with local and WebDAV archives",
         lifespan=lifespan,
         docs_url="/api/docs",
@@ -639,6 +733,68 @@ def create_app(
         )
 
     @app.get(
+        "/download/{camera_id}",
+        dependencies=[Depends(require_playback_auth)],
+    )
+    async def download_recording(camera_id: str, start: str, end: str) -> Response:
+        start_dt = _parse_datetime(start, service.config.storage.timezone)
+        end_dt = _parse_datetime(end, service.config.storage.timezone)
+        assert start_dt is not None and end_dt is not None
+        if start_dt >= end_dt:
+            raise HTTPException(status_code=422, detail="start must be before end")
+        if end_dt - start_dt > timedelta(hours=24):
+            raise HTTPException(status_code=422, detail="one download cannot exceed 24 hours")
+        try:
+            records = await service.archive_records(camera_id, start=start_dt, end=end_dt)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="unknown camera") from exc
+        except StorageBackendError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        if not records:
+            raise HTTPException(status_code=404, detail="no recordings in this time range")
+
+        clipped_start = max(start_dt, records[0].start)
+        clipped_end = min(end_dt, records[-1].end)
+        if clipped_start >= clipped_end:
+            raise HTTPException(status_code=404, detail="no recordings in this time range")
+        if download_slot.locked():
+            raise HTTPException(
+                status_code=429,
+                detail="another video download is in progress",
+                headers={"Retry-After": "10"},
+            )
+        await download_slot.acquire()
+        try:
+            command = build_download_command(
+                service.config.recording,
+                start_offset_seconds=(clipped_start - records[0].start).total_seconds(),
+                duration_seconds=(clipped_end - clipped_start).total_seconds(),
+            )
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception:
+            download_slot.release()
+            raise
+
+        timezone = ZoneInfo(service.config.storage.timezone)
+        start_stamp = clipped_start.astimezone(timezone).strftime("%Y%m%d-%H%M%S")
+        end_stamp = clipped_end.astimezone(timezone).strftime("%Y%m%d-%H%M%S")
+        filename = f"{camera_id}_{start_stamp}_{end_stamp}.mp4"
+        return StreamingResponse(
+            _stream_download(service, process, records, download_slot),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store, max-age=0",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.get(
         "/recordings/{camera_id}/{relative_path:path}",
         dependencies=[Depends(require_playback_auth)],
     )
@@ -704,6 +860,11 @@ def create_app(
 <div class="camera-foot"><span id="profile-{camera.id}">等待码流信息</span>
 <span id="rate-{camera.id}">0 B / 分钟</span></div></article>"""
             )
+        download_options = "".join(
+            f'<option value="{camera.id}">{html.escape(camera.name or camera.id)}</option>'
+            for camera in service.config.cameras
+            if camera.enabled
+        )
         bootstrap = _script_json(
             {
                 "cameras": [
@@ -723,9 +884,9 @@ def create_app(
         )
         page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark">
-<title>CamVault · 监控中心</title><link rel="stylesheet" href="/assets/dashboard.css?v=7">
+<title>CamVault · 监控中心</title><link rel="stylesheet" href="/assets/dashboard.css?v=8">
 <script defer src="https://cdn.jsdelivr.net/npm/hls.js@1.7.2/dist/hls.min.js"></script>
-<script>window.CAMVAULT_BOOTSTRAP={bootstrap};</script><script defer src="/assets/dashboard.js?v=7"></script></head>
+<script>window.CAMVAULT_BOOTSTRAP={bootstrap};</script><script defer src="/assets/dashboard.js?v=8"></script></head>
 <body><header class="app-header"><a class="brand" href="/"><span class="brand-mark"><i></i></span><span><b>CamVault</b><small>视频归档系统</small></span></a>
 <nav><button class="nav-item active" data-view="monitor">监控中心</button><button class="nav-item" data-view="system">系统管理</button></nav>
 <div class="header-actions"><span class="health-chip" id="overall"><i></i>正在连接</span><button class="icon-button" id="logout" title="退出登录" hidden>退出</button></div></header>
@@ -740,7 +901,8 @@ def create_app(
 <div class="zoom-tools"><span class="sound-key"><i></i>有声音</span><button id="nextSound">下一段声音</button><button id="zoomOut" title="缩小时间范围">−</button><button id="zoomIn" title="放大时间范围">＋</button><button id="jumpNow">回到现在</button></div></div>
 <div class="timeline-wrap"><canvas id="timeline" tabindex="0" role="slider" aria-label="录像时间轴"></canvas><div class="timeline-loading" id="timelineLoading">正在载入录像索引</div></div>
 <div class="selection-row"><div><span>回放开始</span><input id="historyStart" type="datetime-local" step="1"></div><div><span>回放结束</span><input id="historyEnd" type="datetime-local" step="1"></div>
-<label class="rate-control"><span>播放速度</span><select id="playbackRate"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option><option value="4">4×</option><option value="8">8×</option></select></label><button id="applyHistory" class="primary">播放所选时段</button><small>橙色表示有声音 · 点击橙色片段快速框选</small></div></div></section>
+<label class="rate-control"><span>播放速度</span><select id="playbackRate"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option><option value="4">4×</option><option value="8">8×</option></select></label><button id="applyHistory" class="primary">播放所选时段</button>
+<label class="download-control"><span>下载</span><select id="downloadCamera">{download_options}</select></label><button id="downloadHistory" class="quiet">导出 MP4</button><small>橙色表示有声音 · 点击橙色片段快速框选</small></div></div></section>
 <section class="camera-grid">{"".join(camera_cards)}</section></section>
 <section id="systemView" hidden><div class="section-heading"><div><p class="eyebrow">SYSTEM</p><h1>系统管理</h1><p>修改配置、检查运行日志与执行归档清理</p></div></div>
 <div class="system-grid"><article class="panel"><div class="panel-head"><div><h2>运行配置</h2><p>保存时自动校验，并保留上一份备份</p></div><button id="reload" class="quiet">重新读取</button></div>

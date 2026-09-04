@@ -100,6 +100,27 @@
     return query ? `${base}?${query}` : base;
   }
 
+  function downloadUrl(cameraId) {
+    const params = new URLSearchParams({
+      start: timeline.selectionStart.toISOString(),
+      end: timeline.selectionEnd.toISOString(),
+    });
+    if (boot.token) params.set("token", boot.token);
+    return `/download/${encodeURIComponent(cameraId)}?${params}`;
+  }
+
+  function validHistorySelection(forDownload = false) {
+    if (timeline.selectionStart >= timeline.selectionEnd) {
+      showToast("结束时间必须晚于开始时间", true);
+      return false;
+    }
+    if (forDownload && timeline.selectionEnd - timeline.selectionStart > 24 * 3600_000) {
+      showToast("单个下载时段不能超过 24 小时", true);
+      return false;
+    }
+    return true;
+  }
+
   function setMessage(cameraId, value) {
     const element = $(`message-${cameraId}`);
     if (element) element.textContent = value;
@@ -663,11 +684,24 @@
     requestTimelineDraw();
   });
   $("applyHistory").addEventListener("click", () => {
-    if (timeline.selectionStart >= timeline.selectionEnd) {
-      showToast("回放结束时间必须晚于开始时间", true);
+    if (!validHistorySelection()) return;
+    attachAll();
+  });
+  $("downloadHistory").addEventListener("click", () => {
+    if (!validHistorySelection(true)) return;
+    const cameraId = $("downloadCamera").value;
+    if (!cameraId) {
+      showToast("没有可下载的摄像头", true);
       return;
     }
-    attachAll();
+    const link = document.createElement("a");
+    link.href = downloadUrl(cameraId);
+    link.download = "";
+    link.hidden = true;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    showToast("正在导出所选时段；视频保持原画质且不会写入临时磁盘");
   });
   $("playbackRate").addEventListener("change", () => {
     playbackRate = Number($("playbackRate").value) || 1;

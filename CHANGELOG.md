@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0 — 2026-09-04
+
+- Added per-camera MP4 download for the time range selected on the history timeline.
+- Exports local and WebDAV archives through a bounded streaming pipeline: one concurrent
+  export, no temporary media file and FFmpeg stream copy instead of video transcoding.
+- Limited one export to 24 hours and added cancellation cleanup so abandoned browser
+  downloads promptly close remote reads and the FFmpeg process.
+
 ## 0.6.0 — 2026-09-04
 
 - Added synchronized 0.5×–8× history playback and removed the redundant codec badge

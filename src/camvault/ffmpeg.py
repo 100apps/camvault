@@ -217,6 +217,53 @@ def build_camera_command(
     return args
 
 
+def build_download_command(
+    recording: RecordingConfig,
+    *,
+    start_offset_seconds: float,
+    duration_seconds: float,
+) -> list[str]:
+    """Build a streaming MP4 remux command for an archive selection.
+
+    Input and output both use pipes, so downloads never create a temporary media file.
+    Stream copy preserves source quality and keeps CPU usage far below transcoding.
+    """
+
+    return [
+        recording.ffmpeg_path,
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "+genpts+discardcorrupt",
+        "-i",
+        "pipe:0",
+        # Output-side seeking works with the non-seekable archive input pipe. With
+        # stream copy the video starts at the nearest keyframe, without decoding.
+        "-ss",
+        f"{max(0.0, start_offset_seconds):.3f}",
+        "-t",
+        f"{max(0.001, duration_seconds):.3f}",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c",
+        "copy",
+        # Archived MPEG-TS carries AAC in ADTS frames; MP4 stores AudioSpecificConfig.
+        "-bsf:a",
+        "aac_adtstoasc",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-movflags",
+        "+frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+    ]
+
+
 def build_synthetic_command(
     *,
     camera_id: str,

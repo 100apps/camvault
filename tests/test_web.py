@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -16,7 +17,17 @@ from camvault.web import _script_json, create_app
 
 
 @pytest.mark.asyncio
-async def test_ingest_auth_live_and_vod_playback(tmp_path: Path) -> None:
+async def test_ingest_auth_live_and_vod_playback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "camvault.web.build_download_command",
+        lambda *_args, **_kwargs: [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())",
+        ],
+    )
     config = AppConfig(
         server=ServerConfig(
             host="127.0.0.1",
@@ -96,6 +107,29 @@ async def test_ingest_auth_live_and_vod_playback(tmp_path: Path) -> None:
                 },
             )
             assert "#EXT-X-START:TIME-OFFSET=1.000,PRECISE=YES" in seek_vod.text
+
+            download = await client.get(
+                "/download/front",
+                params={
+                    "start": records[0].start.isoformat(),
+                    "end": records[0].end.isoformat(),
+                    "token": "play-token",
+                },
+            )
+            assert download.status_code == 200
+            assert download.content == b"aaabbb"
+            assert download.headers["content-type"].startswith("video/mp4")
+            assert download.headers["content-disposition"].endswith('.mp4"')
+
+            oversized = await client.get(
+                "/download/front",
+                params={
+                    "start": records[0].start.isoformat(),
+                    "end": (records[0].start + timedelta(hours=25)).isoformat(),
+                    "token": "play-token",
+                },
+            )
+            assert oversized.status_code == 422
 
             status = await client.get("/api/status", params={"token": "play-token"})
             payload = status.json()
@@ -214,9 +248,11 @@ rtsp_url = "rtsp://127.0.0.1/unused"
         assert "实时监控" in dashboard.text
         assert "历史回放" in dashboard.text
         assert "hls.js@1.7.2" in dashboard.text
-        assert "/assets/dashboard.js?v=7" in dashboard.text
+        assert "/assets/dashboard.js?v=8" in dashboard.text
         assert 'id="playbackRate"' in dashboard.text
         assert 'id="nextSound"' in dashboard.text
+        assert 'id="downloadCamera"' in dashboard.text
+        assert 'id="downloadHistory"' in dashboard.text
         assert "原码直通" not in dashboard.text
         assert '"codecMode": "h264"' in dashboard.text
 

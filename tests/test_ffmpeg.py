@@ -3,7 +3,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from camvault.config import CameraConfig, RecordingConfig
-from camvault.ffmpeg import build_camera_command, ffmpeg_has_decoder, redacted_command
+from camvault.ffmpeg import (
+    build_camera_command,
+    build_download_command,
+    ffmpeg_has_decoder,
+    redacted_command,
+)
 
 
 def test_camera_command_uses_http_put_without_temporary_segment_files() -> None:
@@ -76,6 +81,24 @@ def test_camera_command_formats_ipv6_loopback_url() -> None:
         run_id="ipv6",
     )
     assert any(item.startswith("http://[::1]:8088/_ingest/front/") for item in command)
+
+
+def test_download_command_stream_copies_fragmented_mp4_without_temp_files() -> None:
+    command = build_download_command(
+        RecordingConfig(ffmpeg_path="/opt/ffmpeg"),
+        start_offset_seconds=12.3456,
+        duration_seconds=45.6789,
+    )
+    joined = " ".join(command)
+    assert command[0] == "/opt/ffmpeg"
+    assert "-ss 12.346" in joined
+    assert "-t 45.679" in joined
+    assert "-c copy" in joined
+    assert "-bsf:a aac_adtstoasc" in joined
+    assert "-f mp4 pipe:1" in joined
+    assert "frag_keyframe+empty_moov+default_base_moof" in joined
+    assert not any(".mp4" in item or ".ts" in item for item in command)
+    assert command.index("-ss") > command.index("-i")
 
 
 def test_decoder_check_requires_exact_software_decoder_name(monkeypatch) -> None:
