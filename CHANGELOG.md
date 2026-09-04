@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0 — 2026-09-04
+
+- Added synchronized 0.5×–8× history playback and removed the redundant codec badge
+  overlay from camera video.
+- Added configurable low-overhead audio activity indexing in the existing FFmpeg AAC
+  path, with per-segment RMS levels stored in each local/WebDAV JSON sidecar.
+- Added orange sound activity marks, click-to-select and next-sound navigation to the
+  zoomable timeline. WebDAV timelines read a bounded bitmap from archive filenames, so
+  rendering sound marks does not download every sidecar or rescan media.
+
 ## 0.5.0 — 2026-09-04
 
 - Switched browser playback to the highest-resolution camera profile and added explicit

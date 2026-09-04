@@ -17,6 +17,8 @@ class LiveSegment:
     duration: float
     stream_id: str | None = None
     discontinuity_sequence: int = 0
+    audio_rms_db: float | None = None
+    audio_active: bool = False
 
 
 class LiveBuffer:

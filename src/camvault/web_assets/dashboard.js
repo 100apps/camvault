@@ -13,6 +13,7 @@
   let statusTimer = null;
   let logTimer = null;
   let currentView = "monitor";
+  let playbackRate = 1;
 
   const timeline = {
     canvas: $("timeline"),
@@ -104,6 +105,12 @@
     if (element) element.textContent = value;
   }
 
+  function applyPlaybackRate(video) {
+    const rate = mode === "history" ? playbackRate : 1;
+    video.defaultPlaybackRate = rate;
+    video.playbackRate = rate;
+  }
+
   function destroyPlayer(cameraId) {
     const current = players.get(cameraId);
     if (current && current.hls) current.hls.destroy();
@@ -122,6 +129,7 @@
     const video = $(`video-${camera.id}`);
     const source = streamUrl(camera);
     const label = mode === "live" ? "实时画面" : "历史录像";
+    applyPlaybackRate(video);
     setMessage(camera.id, `正在连接${label}`);
 
     if (window.Hls && window.Hls.isSupported()) {
@@ -139,6 +147,7 @@
       hls.attachMedia(video);
       hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
         if (players.get(camera.id)?.hls !== hls) return;
+        applyPlaybackRate(video);
         setMessage(camera.id, "");
         video.play().catch(() => setMessage(camera.id, `${label}已就绪，点击画面播放`));
       });
@@ -177,6 +186,7 @@
       video.src = source;
       players.set(camera.id, { hls: null, source });
       video.addEventListener("loadedmetadata", () => {
+        applyPlaybackRate(video);
         setMessage(camera.id, "");
         video.play().catch(() => setMessage(camera.id, `${label}已就绪，点击画面播放`));
       }, { once: true });
@@ -371,6 +381,17 @@
           ctx.fillRect(x1, y + 6, Math.max(2, x2 - x1), Math.max(7, rowHeight - 12));
         }
       });
+      (info?.sound_ranges || []).forEach((range) => {
+        const x1 = Math.max(left, xFor(range.start));
+        const x2 = Math.min(left + plotWidth, xFor(range.end));
+        if (x2 <= x1) return;
+        const level = range.level_db === null || range.level_db === undefined
+          ? .72
+          : Math.max(.28, Math.min(1, (Number(range.level_db) + 60) / 40));
+        const height = Math.max(5, Math.min(11, (rowHeight - 12) * (.35 + level * .45)));
+        ctx.fillStyle = `rgba(233, 174, 79, ${(.58 + level * .35).toFixed(2)})`;
+        ctx.fillRect(x1, y + rowHeight - 6 - height, Math.max(2, x2 - x1), height);
+      });
     });
 
     const selectionX1 = Math.max(left, xFor(timeline.selectionStart));
@@ -442,6 +463,30 @@
     scheduleTimelineLoad();
   }
 
+  function allSoundRanges() {
+    return (timelineData?.cameras || [])
+      .flatMap((camera) => camera.sound_ranges || [])
+      .sort((left, right) => new Date(left.start) - new Date(right.start));
+  }
+
+  function selectSoundRange(range) {
+    const start = new Date(range.start);
+    const end = new Date(range.end);
+    timeline.selectionStart = new Date(start.getTime() - 5_000);
+    timeline.selectionEnd = new Date(Math.max(end.getTime() + 15_000, start.getTime() + 30_000));
+    syncInputs();
+    requestTimelineDraw();
+  }
+
+  function soundRangeNear(point) {
+    const tolerance = (timeline.viewEnd - timeline.viewStart) / Math.max(1, timeline.layout?.width || 1) * 6;
+    const instant = point.getTime();
+    return allSoundRanges().find((range) => (
+      instant >= new Date(range.start).getTime() - tolerance
+      && instant <= new Date(range.end).getTime() + tolerance
+    ));
+  }
+
   timeline.canvas.addEventListener("pointerdown", (event) => {
     if (!timeline.layout) return;
     timeline.canvas.setPointerCapture(event.pointerId);
@@ -483,9 +528,14 @@
     if (!drag) return;
     if (drag.mode === "select" && Math.abs(event.clientX - drag.x) < 4) {
       const center = timeAtX(event.clientX);
-      const half = Math.min(5 * 60_000, (timeline.viewEnd - timeline.viewStart) / 20);
-      timeline.selectionStart = new Date(center.getTime() - half);
-      timeline.selectionEnd = new Date(center.getTime() + half);
+      const sound = soundRangeNear(center);
+      if (sound) {
+        selectSoundRange(sound);
+      } else {
+        const half = Math.min(5 * 60_000, (timeline.viewEnd - timeline.viewStart) / 20);
+        timeline.selectionStart = new Date(center.getTime() - half);
+        timeline.selectionEnd = new Date(center.getTime() + half);
+      }
       syncInputs();
     }
     if (drag.mode === "pan") scheduleTimelineLoad();
@@ -582,6 +632,17 @@
     timeline.viewStart = new Date(timeline.viewEnd.getTime() - span);
     scheduleTimelineLoad();
   });
+  $("nextSound").addEventListener("click", () => {
+    const ranges = allSoundRanges();
+    if (!ranges.length) {
+      showToast("当前时间范围内没有检测到声音");
+      return;
+    }
+    const after = timeline.selectionEnd.getTime() + 1_000;
+    const range = ranges.find((item) => new Date(item.start).getTime() >= after) || ranges[0];
+    selectSoundRange(range);
+    showToast(`已定位到 ${new Date(range.start).toLocaleString()} 的声音片段`);
+  });
   document.querySelectorAll("[data-span]").forEach((button) => {
     button.addEventListener("click", () => {
       const span = Number(button.dataset.span);
@@ -607,6 +668,14 @@
       return;
     }
     attachAll();
+  });
+  $("playbackRate").addEventListener("change", () => {
+    playbackRate = Number($("playbackRate").value) || 1;
+    players.forEach((_player, cameraId) => {
+      const video = $(`video-${cameraId}`);
+      if (video) applyPlaybackRate(video);
+    });
+    showToast(`回放速度已设为 ${playbackRate}×`);
   });
   $("reload").addEventListener("click", loadConfig);
   $("save").addEventListener("click", saveConfig);

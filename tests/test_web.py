@@ -59,9 +59,11 @@ async def test_ingest_auth_live_and_vod_playback(tmp_path: Path) -> None:
                     "/_ingest/front/index.m3u8", content=playlist_hint, headers=headers
                 )
             ).status_code == 201
+            service._on_audio_level("front", -20.0)
             assert (
                 await client.put("/_ingest/front/a.ts", content=b"aaa", headers=headers)
             ).status_code == 201
+            service._on_audio_level("front", -70.0)
             assert (
                 await client.put("/_ingest/front/b.ts", content=b"bbb", headers=headers)
             ).status_code == 201
@@ -113,6 +115,8 @@ async def test_ingest_auth_live_and_vod_playback(tmp_path: Path) -> None:
             )
             assert timeline.status_code == 200
             assert timeline.json()["cameras"][0]["ranges"][0]["records"] == 1
+            assert len(timeline.json()["cameras"][0]["sound_ranges"]) == 1
+            assert timeline.json()["cameras"][0]["sound_ranges"][0]["level_db"] == -20.0
     finally:
         await service.stop()
 
@@ -210,9 +214,11 @@ rtsp_url = "rtsp://127.0.0.1/unused"
         assert "实时监控" in dashboard.text
         assert "历史回放" in dashboard.text
         assert "hls.js@1.7.2" in dashboard.text
-        assert "/assets/dashboard.js?v=6" in dashboard.text
+        assert "/assets/dashboard.js?v=7" in dashboard.text
+        assert 'id="playbackRate"' in dashboard.text
+        assert 'id="nextSound"' in dashboard.text
+        assert "原码直通" not in dashboard.text
         assert '"codecMode": "h264"' in dashboard.text
-        assert "H.264 主码流" in dashboard.text
 
 
 @pytest.mark.asyncio

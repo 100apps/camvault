@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import time
 from collections.abc import Awaitable, Callable
@@ -25,12 +26,14 @@ class CameraSupervisor:
         runtime: CameraRuntime,
         ingest_secret: str,
         on_stream_end: Callable[[str], Awaitable[None]] | None = None,
+        on_audio_level: Callable[[str, float], None] | None = None,
     ) -> None:
         self.app_config = app_config
         self.camera = camera
         self.runtime = runtime
         self.ingest_secret = ingest_secret
         self.on_stream_end = on_stream_end
+        self.on_audio_level = on_audio_level
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._process: asyncio.subprocess.Process | None = None
@@ -57,6 +60,7 @@ class CameraSupervisor:
             segments_at_launch = self.runtime.segments_ingested
             stderr_tail: list[str] = []
             stderr_task: asyncio.Task[None] | None = None
+            stdout_task: asyncio.Task[None] | None = None
             process_started = False
             try:
                 self._set_state("resolving", "resolving ONVIF/RTSP stream")
@@ -91,7 +95,18 @@ class CameraSupervisor:
                 self._process = await asyncio.create_subprocess_exec(
                     *command,
                     stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.DEVNULL,
+                    stdout=(
+                        asyncio.subprocess.PIPE
+                        if self.on_audio_level is not None
+                        and recording.audio_index_enabled
+                        and (
+                            recording.include_audio
+                            if self.camera.include_audio is None
+                            else self.camera.include_audio
+                        )
+                        and (self.camera.audio_codec or recording.audio_codec) == "aac"
+                        else asyncio.subprocess.DEVNULL
+                    ),
                     stderr=asyncio.subprocess.PIPE,
                 )
                 self.runtime.process_pid = self._process.pid
@@ -102,10 +117,17 @@ class CameraSupervisor:
                     self._read_stderr(self._process, stderr_tail),
                     name=f"stderr-{self.camera.id}",
                 )
+                if self._process.stdout is not None:
+                    stdout_task = asyncio.create_task(
+                        self._read_audio_levels(self._process),
+                        name=f"audio-index-{self.camera.id}",
+                    )
                 exit_code, watchdog_reason = await self._watch_process(
                     self._process, process_started_monotonic, segments_at_launch
                 )
                 await asyncio.gather(stderr_task, return_exceptions=True)
+                if stdout_task is not None:
+                    await asyncio.gather(stdout_task, return_exceptions=True)
                 if self._stop.is_set():
                     break
 
@@ -130,6 +152,8 @@ class CameraSupervisor:
                     await self._terminate(process)
                 if stderr_task is not None:
                     await asyncio.gather(stderr_task, return_exceptions=True)
+                if stdout_task is not None:
+                    await asyncio.gather(stdout_task, return_exceptions=True)
                 self.runtime.process_pid = None
                 self._process = None
                 if process_started and self.on_stream_end is not None:
@@ -215,6 +239,28 @@ class CameraSupervisor:
             del tail[:-20]
             logger.warning("camera %s ffmpeg: %s", self.camera.id, text)
 
+    async def _read_audio_levels(self, process: asyncio.subprocess.Process) -> None:
+        if process.stdout is None or self.on_audio_level is None:
+            return
+        prefix = b"lavfi.astats.Overall.RMS_level="
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                return
+            if not line.startswith(prefix):
+                continue
+            try:
+                level = float(line[len(prefix) :].strip())
+            except ValueError:
+                continue
+            # Silence is reported as -inf. Keep a finite JSON-safe floor while
+            # discarding malformed positive infinities and NaNs.
+            if level == -math.inf:
+                level = -120.0
+            if not math.isfinite(level):
+                continue
+            self.on_audio_level(self.camera.id, max(-120.0, min(0.0, level)))
+
     async def _terminate(self, process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:
             return
@@ -245,6 +291,7 @@ class SupervisorManager:
         runtimes: dict[str, CameraRuntime],
         ingest_secret: str,
         on_stream_end: Callable[[str], Awaitable[None]] | None = None,
+        on_audio_level: Callable[[str, float], None] | None = None,
     ) -> None:
         self.supervisors = {
             camera.id: CameraSupervisor(
@@ -253,6 +300,7 @@ class SupervisorManager:
                 runtime=runtimes[camera.id],
                 ingest_secret=ingest_secret,
                 on_stream_end=on_stream_end,
+                on_audio_level=on_audio_level,
             )
             for camera in config.cameras
             if camera.enabled

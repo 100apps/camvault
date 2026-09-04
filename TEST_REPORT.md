@@ -2,6 +2,28 @@
 
 测试日期：2026-09-04
 
+## 0.6.0
+
+在 0.5.0 的同一台 Intel Celeron N5105 路由器、两路真实主码流和正式
+AList/百度网盘 WebDAV 后端上完成声音索引与倍速回放验收：
+
+- `pytest -q`：59 项全部通过；Ruff、Node JavaScript 语法、`git diff --check` 通过；
+- 离线构建成功生成 0.6.0 wheel 与 sdist，并安装到 `/data/camvault` 持久虚拟环境；
+- FFmpeg 音量分析复用现有 AAC 解码链路，只启用 `Overall.RMS_level`，关闭默认的全部
+  逐声道及无关统计，不进行录像二次读取或二次解码；
+- WebDAV 归档 JSON v3 实测 `segment_count=30`、`audio_points=30`，一分钟内每个视频
+  分片均有 dB 索引；完整索引与视频一起提交，紧凑活动位图包含在远端文件名中；
+- 真实时间线 API 从 WebDAV 目录索引读出声音活动区间，不需要逐个 GET JSON 侧车；
+- 共享 Chromium 实测 0.5×–8× 选择器、下一段声音、点击框选、Canvas 时间轴及移除
+  播放器码流徽标均正常；CSS/JS 本地载入约 19 ms / 26 ms。
+
+最终优化版 45 秒 `/proc` 差分采样：整机 CPU 5.74%，CamVault + 两路 FFmpeg
+1.27% / 95.1 MiB RSS，AList 0.01% / 84.3 MiB RSS。对比 0.5.0 同一原码直通 + WebDAV
+基线约 1.01%，声音索引增加约 0.26 个整机 CPU 百分点，RSS 未出现可测的持续增长。
+采样期间两路摄像头均无重启。
+
+发布判定：**通过**。
+
 ## 0.5.0
 
 当前发布候选在 Intel Celeron N5105（4 个逻辑核心、约 8 GiB RAM、无 swap）的实际路由器

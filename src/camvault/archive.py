@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -23,6 +24,7 @@ _ARCHIVE_FILENAME_RE = re.compile(
     r"(?P<sequence>\d{12})_"
     r"(?P<duration>\d{9})ms_"
     r"(?P<stream>s(?:none|[0-9a-f]{12}))_"
+    r"(?:(?P<audio_step>a\d{1,4})x(?P<audio_bits>[0-9a-f]{1,64})_)?"
     r"(?P<object>[0-9a-f]{12})\.ts$"
 )
 
@@ -68,6 +70,39 @@ class ArchiveBatch:
             return next(iter(values))
         return None
 
+    @property
+    def audio_index(self) -> tuple[AudioIndexPoint, ...]:
+        points: list[AudioIndexPoint] = []
+        offset = 0.0
+        for segment in self.segments:
+            if segment.audio_rms_db is not None:
+                points.append(
+                    AudioIndexPoint(
+                        offset=round(offset, 3),
+                        duration=round(segment.duration, 3),
+                        rms_db=round(segment.audio_rms_db, 2),
+                        active=segment.audio_active,
+                    )
+                )
+            offset += segment.duration
+        return tuple(points)
+
+
+@dataclass(frozen=True, slots=True)
+class AudioIndexPoint:
+    offset: float
+    duration: float
+    rms_db: float | None
+    active: bool
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "offset": self.offset,
+            "duration": self.duration,
+            "rms_db": self.rms_db,
+            "active": self.active,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class ArchiveRecord:
@@ -81,6 +116,7 @@ class ArchiveRecord:
     sha256: str | None = None
     segment_count: int | None = None
     stream_id: str | None = None
+    audio_index: tuple[AudioIndexPoint, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -93,6 +129,7 @@ class ArchiveRecord:
             "sha256": self.sha256,
             "segment_count": self.segment_count,
             "stream_id": self.stream_id,
+            "audio_index": [point.as_dict() for point in self.audio_index],
         }
 
 
@@ -103,6 +140,7 @@ class ParsedArchiveName:
     sequence: int
     stream_id: str | None
     object_id: str
+    audio_index: tuple[AudioIndexPoint, ...] = ()
 
 
 def _stream_tag(stream_id: str | None) -> str:
@@ -121,9 +159,10 @@ def archive_relative_path(batch: ArchiveBatch, storage: StorageConfig) -> str:
     stamp = local_start.strftime("%Y%m%dT%H%M%S%z")
     first_sequence = batch.segments[0].sequence
     duration_ms = round(batch.duration * 1000)
+    audio_tag = _audio_filename_tag(batch)
     filename = (
         f"{stamp}_{first_sequence:012d}_{duration_ms:09d}ms_"
-        f"{_stream_tag(batch.stream_id)}_{batch.object_id}.ts"
+        f"{_stream_tag(batch.stream_id)}_{audio_tag}{batch.object_id}.ts"
     )
     return PurePosixPath(
         local_start.strftime("%Y"),
@@ -147,15 +186,57 @@ def parse_archive_filename(filename: str) -> ParsedArchiveName | None:
         duration = int(match.group("duration")) / 1000.0
         stream_tag = None if legacy else match.group("stream")
         stream_id = None if stream_tag is None or stream_tag == "snone" else f"tag:{stream_tag[1:]}"
+        audio_index: tuple[AudioIndexPoint, ...] = ()
+        if not legacy and match.group("audio_step") and match.group("audio_bits"):
+            step = int(match.group("audio_step")[1:])
+            slot_count = max(1, math.ceil(duration / step))
+            bits = bin(int(match.group("audio_bits"), 16))[2:].zfill(slot_count)[-slot_count:]
+            audio_index = tuple(
+                AudioIndexPoint(
+                    offset=float(index * step),
+                    duration=min(float(step), max(0.001, duration - index * step)),
+                    rms_db=None,
+                    active=True,
+                )
+                for index, active in enumerate(bits)
+                if active == "1" and index * step < duration
+            )
         return ParsedArchiveName(
             start=start,
             duration=duration,
             sequence=int(match.group("sequence")),
             stream_id=stream_id,
             object_id=match.group("object"),
+            audio_index=audio_index,
         )
     except (ValueError, OverflowError):
         return None
+
+
+def _audio_filename_tag(batch: ArchiveBatch) -> str:
+    """Encode a bounded activity bitmap for zero-request WebDAV timelines.
+
+    The detailed dB values live in the JSON sidecar. The filename carries at most 128
+    activity buckets, which lets a PROPFIND directory listing render sound marks without
+    downloading every sidecar from remote storage.
+    """
+
+    if not any(segment.audio_rms_db is not None for segment in batch.segments):
+        return ""
+    step = max(1, math.ceil(batch.duration / 128))
+    slot_count = max(1, math.ceil(batch.duration / step))
+    active = [False] * slot_count
+    offset = 0.0
+    for segment in batch.segments:
+        if segment.audio_active:
+            first = max(0, math.floor(offset / step))
+            final = min(slot_count - 1, math.ceil((offset + segment.duration) / step) - 1)
+            for index in range(first, final + 1):
+                active[index] = True
+        offset += segment.duration
+    bits = "".join("1" if value else "0" for value in active)
+    encoded = f"{int(bits, 2):0{math.ceil(slot_count / 4)}x}"
+    return f"a{step}x{encoded}_"
 
 
 class ArchiveAccumulator:
@@ -407,6 +488,24 @@ def _record_from_metadata(
         start = start.replace(tzinfo=UTC)
     if end.tzinfo is None:
         end = end.replace(tzinfo=UTC)
+    raw_audio_index = payload.get("audio_index", [])
+    audio_index: list[AudioIndexPoint] = []
+    if isinstance(raw_audio_index, list):
+        for raw in raw_audio_index:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                rms_value = raw.get("rms_db")
+                audio_index.append(
+                    AudioIndexPoint(
+                        offset=max(0.0, float(raw["offset"])),
+                        duration=max(0.001, float(raw["duration"])),
+                        rms_db=float(rms_value) if rms_value is not None else None,
+                        active=bool(raw.get("active", False)),
+                    )
+                )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
     return ArchiveRecord(
         camera_id=camera_id,
         path=media_path,
@@ -420,6 +519,7 @@ def _record_from_metadata(
             int(payload["segment_count"]) if payload.get("segment_count") is not None else None
         ),
         stream_id=str(payload["stream_id"]) if payload.get("stream_id") is not None else None,
+        audio_index=tuple(audio_index),
     )
 
 
@@ -443,7 +543,7 @@ def write_archive_batch(batch: ArchiveBatch, storage: StorageConfig) -> ArchiveR
     if final_path.is_file() and metadata_path.is_file():
         try:
             payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-            if payload.get("version") in {1, 2} and payload.get("format") == "mpegts":
+            if payload.get("version") in {1, 2, 3} and payload.get("format") == "mpegts":
                 return _record_from_metadata(
                     camera_id=batch.camera_id,
                     media_path=final_path,
@@ -479,10 +579,11 @@ def write_archive_batch(batch: ArchiveBatch, storage: StorageConfig) -> ArchiveR
             sha256=digest.hexdigest(),
             segment_count=len(batch.segments),
             stream_id=batch.stream_id,
+            audio_index=batch.audio_index,
         )
         metadata = record.as_dict() | {
             "format": "mpegts",
-            "version": 2,
+            "version": 3,
             "sequences": [batch.segments[0].sequence, batch.segments[-1].sequence],
             "object_id": batch.object_id,
         }
@@ -516,7 +617,7 @@ def scan_archive_records(root: Path, camera_id: str) -> list[ArchiveRecord]:
     for metadata_path in camera_root.rglob("*.json"):
         try:
             payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-            if payload.get("version") not in {1, 2} or payload.get("format") != "mpegts":
+            if payload.get("version") not in {1, 2, 3} or payload.get("format") != "mpegts":
                 continue
             media_path = metadata_path.with_suffix(".ts")
             if not media_path.is_file():

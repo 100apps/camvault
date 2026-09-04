@@ -91,11 +91,15 @@ class CamVaultService:
             camera_id: deque() for camera_id in enabled_ids
         }
         self._last_stream_ids: dict[str, str] = {}
+        # One peak value per camera is enough for the next HLS segment and keeps
+        # memory constant even when the storage backend is slow.
+        self._audio_peaks: dict[str, float | None] = {camera_id: None for camera_id in enabled_ids}
         self.supervisors = SupervisorManager(
             config=config,
             runtimes=self.runtimes,
             ingest_secret=self.ingest_secret,
             on_stream_end=self._on_stream_end,
+            on_audio_level=self._on_audio_level,
         )
         self._retention_task: asyncio.Task[None] | None = None
         self._retention_lock = asyncio.Lock()
@@ -194,6 +198,13 @@ class CamVaultService:
         )
         if segment is None:
             return "duplicate"
+        audio_level = self._audio_peaks.get(camera_id)
+        self._audio_peaks[camera_id] = None
+        segment.audio_rms_db = audio_level
+        segment.audio_active = (
+            audio_level is not None
+            and audio_level >= self.config.recording.audio_activity_threshold_db
+        )
         if stream_id is not None:
             self._last_stream_ids[camera_id] = stream_id
         runtime = self.runtimes[camera_id]
@@ -433,6 +444,12 @@ class CamVaultService:
         # Seal a short tail immediately. It is enqueued but not synchronously persisted, so
         # reconnect remains responsive while the archive worker preserves ordering.
         await self.archive_manager.rotate_camera(camera_id)
+        self._audio_peaks[camera_id] = None
+
+    def _on_audio_level(self, camera_id: str, level_db: float) -> None:
+        current = self._audio_peaks.get(camera_id)
+        if current is None or level_db > current:
+            self._audio_peaks[camera_id] = level_db
 
     def _on_archive_written(self, record: ArchiveRecord) -> None:
         runtime = self.runtimes[record.camera_id]

@@ -26,6 +26,8 @@ def _segment(
     created_at: datetime,
     duration: float = 2.0,
     stream_id: str | None = None,
+    audio_rms_db: float | None = None,
+    audio_active: bool = False,
 ) -> LiveSegment:
     return LiveSegment(
         sequence=sequence,
@@ -34,6 +36,8 @@ def _segment(
         created_at=created_at,
         duration=duration,
         stream_id=stream_id,
+        audio_rms_db=audio_rms_db,
+        audio_active=audio_active,
     )
 
 
@@ -49,8 +53,21 @@ def test_archive_is_atomic_hashed_and_partitioned_by_local_hour(tmp_path: Path) 
     batch = ArchiveBatch(
         camera_id="front",
         segments=(
-            _segment(7, b"abc", start, stream_id="run-a"),
-            _segment(8, b"def", start + timedelta(seconds=2), stream_id="run-a"),
+            _segment(
+                7,
+                b"abc",
+                start,
+                stream_id="run-a",
+                audio_rms_db=-22.5,
+                audio_active=True,
+            ),
+            _segment(
+                8,
+                b"def",
+                start + timedelta(seconds=2),
+                stream_id="run-a",
+                audio_rms_db=-64.0,
+            ),
         ),
     )
     record = write_archive_batch(batch, storage)
@@ -61,14 +78,28 @@ def test_archive_is_atomic_hashed_and_partitioned_by_local_hour(tmp_path: Path) 
     assert not list(storage.root.rglob("*.partial"))
 
     metadata = json.loads(record.path.with_suffix(".json").read_text(encoding="utf-8"))
-    assert metadata["version"] == 2
+    assert metadata["version"] == 3
     assert metadata["format"] == "mpegts"
     assert metadata["sequences"] == [7, 8]
     assert metadata["stream_id"] == "run-a"
+    assert metadata["audio_index"][0] == {
+        "offset": 0.0,
+        "duration": 2.0,
+        "rms_db": -22.5,
+        "active": True,
+    }
+    parsed = parse_archive_filename(record.path.name)
+    assert parsed is not None
+    assert [(point.offset, point.duration) for point in parsed.audio_index] == [
+        (0.0, 1.0),
+        (1.0, 1.0),
+    ]
     scanned = scan_archive_records(storage.root, "front")
     assert len(scanned) == 1
     assert scanned[0].sha256 == record.sha256
     assert scanned[0].stream_id == "run-a"
+    assert scanned[0].audio_index[0].rms_db == -22.5
+    assert scanned[0].audio_index[0].active is True
 
 
 @pytest.mark.asyncio

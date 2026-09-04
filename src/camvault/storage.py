@@ -292,7 +292,7 @@ class WebDAVStorageBackend(StorageBackend):
             ),
             verify=self.config.verify_tls,
             follow_redirects=True,
-            headers={"User-Agent": "CamVault/0.5.0", "Accept-Encoding": "identity"},
+            headers={"User-Agent": "CamVault/0.6.0", "Accept-Encoding": "identity"},
         )
 
     @property
@@ -377,10 +377,11 @@ class WebDAVStorageBackend(StorageBackend):
             sha256=digest.hexdigest(),
             segment_count=len(batch.segments),
             stream_id=batch.stream_id,
+            audio_index=batch.audio_index,
         )
         metadata = record.as_dict() | {
             "format": "mpegts",
-            "version": 2,
+            "version": 3,
             "sequences": [batch.segments[0].sequence, batch.segments[-1].sequence],
             "object_id": batch.object_id,
             "backend": "webdav",
@@ -701,6 +702,7 @@ class WebDAVStorageBackend(StorageBackend):
                     duration=parsed.duration,
                     size_bytes=entry.size_bytes,
                     stream_id=parsed.stream_id,
+                    audio_index=parsed.audio_index,
                 )
             )
         records.sort(key=lambda record: record.start)

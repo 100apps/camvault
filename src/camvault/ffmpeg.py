@@ -175,6 +175,20 @@ def build_camera_command(
         raise FFmpegError(f"unsupported video codec mode: {video_codec}")
 
     if audio_codec == "aac":
+        if recording.audio_index_enabled:
+            # astats annotates audio frames already being decoded for AAC output;
+            # ametadata writes only tiny text measurements to the supervisor pipe.
+            args += [
+                "-af",
+                (
+                    "astats=metadata=1:reset=1:measure_perchannel=none:"
+                    "measure_overall=RMS_level,"
+                    # FFmpeg's filter parser and ametadata's file option each consume
+                    # one escaping layer before the pipe protocol sees its colon.
+                    "ametadata=print:key=lavfi.astats.Overall.RMS_level:"
+                    "file=pipe\\\\:1:direct=1"
+                ),
+            ]
         args += ["-c:a", "aac", "-b:a", recording.audio_bitrate]
     elif audio_codec == "copy":
         args += ["-c:a", "copy"]

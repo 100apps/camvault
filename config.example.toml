@@ -89,6 +89,10 @@ video_codec = "h264"
 # AAC improves browser compatibility; set copy to avoid even audio transcoding.
 audio_codec = "aac"
 audio_bitrate = "48k"
+# Reuses the AAC decode path; one lightweight RMS value is kept per HLS segment.
+audio_index_enabled = true
+# Increase toward 0 to ignore quiet ambient noise; decrease to mark softer sounds.
+audio_activity_threshold_db = -35
 h264_preset = "ultrafast"
 h264_crf = 20
 fps_mode = "passthrough"

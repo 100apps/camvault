@@ -24,7 +24,7 @@ def _is_managed_media(path: Path) -> bool:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
-    return payload.get("version") in {1, 2} and payload.get("format") == "mpegts"
+    return payload.get("version") in {1, 2, 3} and payload.get("format") == "mpegts"
 
 
 def _media_files(root: Path) -> list[Path]:

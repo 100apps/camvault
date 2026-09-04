@@ -9,8 +9,8 @@ CamVault 是一个面向家庭多摄像头、7×24 运行的 ONVIF/RTSP 录像�
 - 可选两种归档后端：
   - `local`：内存聚合后，大文件顺序写 HDD/SSD/NAS 挂载目录；
   - `webdav`：内存聚合后直接流式 PUT 到 AList/WebDAV，不建立本地媒体 spool。
-- 录像按 `摄像头/年/月/日/小时` 分区，包含 SHA-256 JSON 侧车。
-- 提供密码登录的专业多摄像头控制台、主码流直播、可缩放/拖选的连续历史时间轴、配置编辑、诊断日志和状态 API。
+- 录像按 `摄像头/年/月/日/小时` 分区，包含 SHA-256 和分片音量索引 JSON 侧车。
+- 提供密码登录的专业多摄像头控制台、主码流直播、倍速回放、带声音活动标记的连续历史时间轴、配置编辑、诊断日志和状态 API。
 - 控制台展示本地/WebDAV 容量、CamVault 归档量、最近 60 秒写入量及每路码率。
 - 支持保留天数、总容量、最低剩余空间、写失败按最旧录像回收及残留事务清理。
 - 日志先进入有界 RAM 环并批量刷入滚动文件，减少高频小写入。
@@ -73,7 +73,7 @@ ffprobe -version
 ### Linux / macOS
 
 ```bash
-unzip camvault-0.5.0.zip
+unzip camvault-0.6.0.zip
 cd camvault
 uv sync
 uv run camvault init
@@ -93,7 +93,7 @@ uv run camvault serve -c config.toml
 ### Windows PowerShell
 
 ```powershell
-Expand-Archive .\camvault-0.5.0.zip -DestinationPath .
+Expand-Archive .\camvault-0.6.0.zip -DestinationPath .
 Set-Location .\camvault
 uv sync
 uv run camvault init
@@ -486,8 +486,25 @@ WebDAV 模式下，浏览器不会获得 AList 凭据。CamVault 在服务端代
 
 历史播放只包含已提交的归档。页面把本地/WebDAV 上按日期、小时保存的分钟分片组合成一条
 连续时间线，并精确跳到用户选择的开始时间；用户可拖动框选、滚轮缩放、按住 Shift 拖动
-平移，也可用 1 小时/6 小时/24 小时/7 天快捷范围。不同 FFmpeg `stream_id` 或明显时间缺口
+平移，也可用 1 小时/6 小时/24 小时/7 天快捷范围。橙色区间表示达到阈值的声音活动，
+可点击橙色片段或使用“下一段声音”快速框选，并以 0.5×–8× 同步回放。不同 FFmpeg
+`stream_id` 或明显时间缺口
 之间会插入 `#EXT-X-DISCONTINUITY`。
+
+声音索引复用本来就用于 AAC 输出的音频解码，实时聚合为每个 HLS 分片一个 RMS 峰值，
+不会二次读取或解码录像。完整 dB 索引跟随媒体写入本地/WebDAV JSON 侧车；归档文件名另带
+最多 128 个时间桶的紧凑活动位图，因此远端时间轴只使用原有 PROPFIND 列表，不会为了画
+声音标记逐个下载每分钟侧车。默认阈值可按环境噪音调整：
+
+```toml
+[recording]
+audio_codec = "aac"
+audio_index_enabled = true
+audio_activity_threshold_db = -35 # 越接近 0，越不容易被环境底噪触发
+```
+
+`audio_codec="copy"` 保持完全直拷贝，CamVault 不会为索引强制解码，此时不生成声音索引；
+也可用 `audio_index_enabled=false` 完全关闭。
 
 ### 编码兼容性
 
@@ -622,7 +639,7 @@ MOVE、配额和限速方面并不等价。
 
 ## 14. 已知边界
 
-- 连续录像，不含移动侦测、AI 事件识别或事件索引；
+- 连续录像，含轻量声音活动索引；不含画面移动侦测或 AI 事件识别；
 - 不做多机高可用；
 - 不是完整 NVR/VMS，不实现 PTZ、ONVIF Profile G、双向语音或厂商私有告警；
 - WebDAV 大范围历史/容量清理依赖 PROPFIND，极大对象树需要进一步做远端索引；

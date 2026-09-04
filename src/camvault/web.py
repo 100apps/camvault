@@ -133,7 +133,7 @@ def create_app(
 
     app = FastAPI(
         title="CamVault",
-        version="0.5.0",
+        version="0.6.0",
         description="RAM-buffered ONVIF/RTSP recorder with local and WebDAV archives",
         lifespan=lifespan,
         docs_url="/api/docs",
@@ -351,31 +351,63 @@ def create_app(
         tolerance = max(1.0, service.config.recording.hls_segment_seconds * 2)
         for camera, records in zip(enabled, results, strict=True):
             ranges: list[dict[str, object]] = []
+            sound_ranges: list[dict[str, object]] = []
             for record in records:
                 clipped_start = max(record.start, start_dt)
                 clipped_end = min(record.end, end_dt)
                 if clipped_start >= clipped_end:
                     continue
+                merged_recording_range = False
                 if ranges:
                     previous_end = datetime.fromisoformat(str(ranges[-1]["end"]))
                     if (clipped_start - previous_end).total_seconds() <= tolerance:
                         ranges[-1]["end"] = max(previous_end, clipped_end).isoformat()
                         ranges[-1]["bytes"] = int(ranges[-1]["bytes"]) + record.size_bytes
                         ranges[-1]["records"] = int(ranges[-1]["records"]) + 1
+                        merged_recording_range = True
+                if not merged_recording_range:
+                    ranges.append(
+                        {
+                            "start": clipped_start.isoformat(),
+                            "end": clipped_end.isoformat(),
+                            "bytes": record.size_bytes,
+                            "records": 1,
+                        }
+                    )
+                for point in record.audio_index:
+                    if not point.active:
                         continue
-                ranges.append(
-                    {
-                        "start": clipped_start.isoformat(),
-                        "end": clipped_end.isoformat(),
-                        "bytes": record.size_bytes,
-                        "records": 1,
-                    }
-                )
+                    sound_start = max(record.start + timedelta(seconds=point.offset), start_dt)
+                    sound_end = min(
+                        record.start + timedelta(seconds=point.offset + point.duration),
+                        end_dt,
+                    )
+                    if sound_start >= sound_end:
+                        continue
+                    if sound_ranges:
+                        previous_sound_end = datetime.fromisoformat(str(sound_ranges[-1]["end"]))
+                        if (sound_start - previous_sound_end).total_seconds() <= 0.25:
+                            sound_ranges[-1]["end"] = max(previous_sound_end, sound_end).isoformat()
+                            previous_level = sound_ranges[-1].get("level_db")
+                            if point.rms_db is not None and (
+                                previous_level is None or point.rms_db > float(previous_level)
+                            ):
+                                sound_ranges[-1]["level_db"] = point.rms_db
+                            continue
+                    sound_ranges.append(
+                        {
+                            "start": sound_start.isoformat(),
+                            "end": sound_end.isoformat(),
+                            "level_db": point.rms_db,
+                        }
+                    )
             cameras.append(
                 {
                     "id": camera.id,
                     "name": camera.name or camera.id,
                     "ranges": ranges,
+                    "sound_ranges": sound_ranges,
+                    "audio_indexed_records": sum(bool(record.audio_index) for record in records),
                     "record_count": len(records),
                     "bytes": sum(record.size_bytes for record in records),
                 }
@@ -385,6 +417,9 @@ def create_app(
                 "start": start_dt.isoformat(),
                 "end": end_dt.isoformat(),
                 "archive_chunk_seconds": service.config.storage.archive_chunk_seconds,
+                "audio_activity_threshold_db": (
+                    service.config.recording.audio_activity_threshold_db
+                ),
                 "cameras": cameras,
             }
         )
@@ -659,15 +694,13 @@ def create_app(
         camera_cards = []
         for camera in service.config.cameras:
             state = "已停用" if not camera.enabled else "正在连接"
-            codec_mode = camera.video_codec or service.config.recording.video_codec
-            quality_label = "原码直通" if codec_mode == "copy" else "H.264 主码流"
             camera_cards.append(
                 f"""<article class="camera-card" data-camera="{camera.id}">
 <div class="camera-head"><div><span class="status-dot" id="dot-{camera.id}"></span>
 <strong>{html.escape(camera.name or camera.id)}</strong></div>
 <span class="camera-state" id="state-{camera.id}">{state}</span></div>
 <div class="video-shell"><video id="video-{camera.id}" controls muted playsinline preload="none"></video>
-<div class="video-placeholder" id="message-{camera.id}">{state}</div><span class="quality-badge">{quality_label}</span></div>
+<div class="video-placeholder" id="message-{camera.id}">{state}</div></div>
 <div class="camera-foot"><span id="profile-{camera.id}">等待码流信息</span>
 <span id="rate-{camera.id}">0 B / 分钟</span></div></article>"""
             )
@@ -690,9 +723,9 @@ def create_app(
         )
         page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark">
-<title>CamVault · 监控中心</title><link rel="stylesheet" href="/assets/dashboard.css?v=6">
+<title>CamVault · 监控中心</title><link rel="stylesheet" href="/assets/dashboard.css?v=7">
 <script defer src="https://cdn.jsdelivr.net/npm/hls.js@1.7.2/dist/hls.min.js"></script>
-<script>window.CAMVAULT_BOOTSTRAP={bootstrap};</script><script defer src="/assets/dashboard.js?v=6"></script></head>
+<script>window.CAMVAULT_BOOTSTRAP={bootstrap};</script><script defer src="/assets/dashboard.js?v=7"></script></head>
 <body><header class="app-header"><a class="brand" href="/"><span class="brand-mark"><i></i></span><span><b>CamVault</b><small>视频归档系统</small></span></a>
 <nav><button class="nav-item active" data-view="monitor">监控中心</button><button class="nav-item" data-view="system">系统管理</button></nav>
 <div class="header-actions"><span class="health-chip" id="overall"><i></i>正在连接</span><button class="icon-button" id="logout" title="退出登录" hidden>退出</button></div></header>
@@ -704,10 +737,10 @@ def create_app(
 <section class="playback-panel"><div class="playback-top"><div class="mode-switch"><button id="modeLive" class="active"><i></i>实时监控</button><button id="modeHistory">历史回放</button></div>
 <p id="playbackNotice">低延迟转发，页面隐藏时自动暂停拉流</p></div>
 <div class="timeline-panel" id="timelinePanel" hidden><div class="timeline-toolbar"><div class="presets"><button data-span="3600000">1 小时</button><button data-span="21600000" class="active">6 小时</button><button data-span="86400000">24 小时</button><button data-span="604800000">7 天</button></div>
-<div class="zoom-tools"><button id="zoomOut" title="缩小时间范围">−</button><button id="zoomIn" title="放大时间范围">＋</button><button id="jumpNow">回到现在</button></div></div>
+<div class="zoom-tools"><span class="sound-key"><i></i>有声音</span><button id="nextSound">下一段声音</button><button id="zoomOut" title="缩小时间范围">−</button><button id="zoomIn" title="放大时间范围">＋</button><button id="jumpNow">回到现在</button></div></div>
 <div class="timeline-wrap"><canvas id="timeline" tabindex="0" role="slider" aria-label="录像时间轴"></canvas><div class="timeline-loading" id="timelineLoading">正在载入录像索引</div></div>
 <div class="selection-row"><div><span>回放开始</span><input id="historyStart" type="datetime-local" step="1"></div><div><span>回放结束</span><input id="historyEnd" type="datetime-local" step="1"></div>
-<button id="applyHistory" class="primary">播放所选时段</button><small>拖动框选 · 滚轮缩放 · 按住 Shift 拖动平移</small></div></div></section>
+<label class="rate-control"><span>播放速度</span><select id="playbackRate"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option><option value="4">4×</option><option value="8">8×</option></select></label><button id="applyHistory" class="primary">播放所选时段</button><small>橙色表示有声音 · 点击橙色片段快速框选</small></div></div></section>
 <section class="camera-grid">{"".join(camera_cards)}</section></section>
 <section id="systemView" hidden><div class="section-heading"><div><p class="eyebrow">SYSTEM</p><h1>系统管理</h1><p>修改配置、检查运行日志与执行归档清理</p></div></div>
 <div class="system-grid"><article class="panel"><div class="panel-head"><div><h2>运行配置</h2><p>保存时自动校验，并保留上一份备份</p></div><button id="reload" class="quiet">重新读取</button></div>

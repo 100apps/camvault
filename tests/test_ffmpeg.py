@@ -31,6 +31,40 @@ def test_camera_command_uses_http_put_without_temporary_segment_files() -> None:
     assert "rtsp://***:***@camera/live" in redacted
 
 
+def test_camera_command_indexes_audio_in_existing_aac_pipeline_only() -> None:
+    camera = CameraConfig(id="front", rtsp_url="rtsp://camera/live")
+    aac = build_camera_command(
+        camera=camera,
+        recording=RecordingConfig(video_codec="copy", audio_codec="aac"),
+        rtsp_url="rtsp://camera/live",
+        ingest_port=8088,
+        ingest_secret="secret",
+    )
+    copied = build_camera_command(
+        camera=camera,
+        recording=RecordingConfig(video_codec="copy", audio_codec="copy"),
+        rtsp_url="rtsp://camera/live",
+        ingest_port=8088,
+        ingest_secret="secret",
+    )
+    disabled = build_camera_command(
+        camera=camera,
+        recording=RecordingConfig(video_codec="copy", audio_codec="aac", audio_index_enabled=False),
+        rtsp_url="rtsp://camera/live",
+        ingest_port=8088,
+        ingest_secret="secret",
+    )
+
+    assert "-af" in aac
+    assert any("Overall.RMS_level" in item for item in aac)
+    assert any("measure_perchannel=none" in item for item in aac)
+    assert any("measure_overall=RMS_level" in item for item in aac)
+    assert any("file=pipe\\\\:1" in item for item in aac)
+    assert any("direct=1" in item for item in aac)
+    assert "-af" not in copied
+    assert "-af" not in disabled
+
+
 def test_camera_command_formats_ipv6_loopback_url() -> None:
     command = build_camera_command(
         camera=CameraConfig(id="front", rtsp_url="rtsp://camera/live"),

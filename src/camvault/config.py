@@ -180,6 +180,11 @@ class RecordingConfig(BaseModel):
     audio_codec: Literal["copy", "aac", "none"] = "aac"
     # 48 kbit/s avoids FFmpeg clamping for common 8 kHz mono G.711 camera audio.
     audio_bitrate: str = "48k"
+    # Audio activity is measured inside the existing FFmpeg audio path. It adds no
+    # second-pass media scan and stores only one small level value per HLS segment.
+    # Filtering requires decoded audio, so indexing is active for the AAC mode.
+    audio_index_enabled: bool = True
+    audio_activity_threshold_db: float = Field(default=-35.0, ge=-120.0, le=0.0)
     # ultrafast trades some archive size for much lower CPU consumption. CRF 20 retains
     # substantially more source detail than FFmpeg's implicit CRF 23 default.
     h264_preset: str = "ultrafast"
