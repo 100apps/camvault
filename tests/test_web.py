@@ -2,18 +2,47 @@ from __future__ import annotations
 
 import logging
 import sys
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
 import pytest
 
+from camvault.archive import ArchiveRecord
 from camvault.config import AppConfig, CameraConfig, RecordingConfig, ServerConfig, StorageConfig
 from camvault.config_store import ConfigStore
 from camvault.logging_setup import RecentLogHandler
 from camvault.service import CamVaultService
-from camvault.web import _script_json, create_app
+from camvault.web import _anchor_download_records, _script_json, create_app
+
+
+def test_download_uses_newest_overlapping_archive_as_seek_anchor() -> None:
+    boundary = datetime(2026, 9, 4, 12, 1, tzinfo=UTC)
+    previous = ArchiveRecord(
+        camera_id="front",
+        path=None,
+        relative_path="previous.ts.enc",
+        start=boundary - timedelta(seconds=60),
+        end=boundary + timedelta(seconds=0.8),
+        duration=60.8,
+        size_bytes=100,
+    )
+    current = ArchiveRecord(
+        camera_id="front",
+        path=None,
+        relative_path="current.ts.enc",
+        start=boundary,
+        end=boundary + timedelta(seconds=60),
+        duration=60,
+        size_bytes=100,
+    )
+
+    assert _anchor_download_records([previous, current], boundary) == [current]
+    assert _anchor_download_records([previous, current], boundary - timedelta(seconds=1)) == [
+        previous,
+        current,
+    ]
 
 
 @pytest.mark.asyncio
@@ -248,7 +277,7 @@ rtsp_url = "rtsp://127.0.0.1/unused"
         assert "实时监控" in dashboard.text
         assert "历史回放" in dashboard.text
         assert "hls.js@1.7.2" in dashboard.text
-        assert "/assets/dashboard.js?v=8" in dashboard.text
+        assert "/assets/dashboard.js?v=9" in dashboard.text
         assert 'id="playbackRate"' in dashboard.text
         assert 'id="nextSound"' in dashboard.text
         assert 'id="downloadCamera"' in dashboard.text

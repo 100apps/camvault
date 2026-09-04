@@ -90,6 +90,9 @@ def test_archive_is_atomic_hashed_and_partitioned_by_local_hour(tmp_path: Path) 
     }
     parsed = parse_archive_filename(record.path.name)
     assert parsed is not None
+    encrypted_parsed = parse_archive_filename(f"{record.path.name}.enc")
+    assert encrypted_parsed is not None
+    assert encrypted_parsed.encrypted is True
     assert [(point.offset, point.duration) for point in parsed.audio_index] == [
         (0.0, 1.0),
         (1.0, 1.0),

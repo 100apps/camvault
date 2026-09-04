@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import ipaddress
 import os
 import re
@@ -81,6 +83,11 @@ class WebDAVConfig(BaseModel):
     username_env: str | None = "CAMVAULT_WEBDAV_USERNAME"
     password: str | None = None
     password_env: str | None = "CAMVAULT_WEBDAV_PASSWORD"
+    # Archive encryption is intentionally WebDAV-only: local deployments can rely on
+    # filesystem encryption, while cloud-bound objects need protection before upload.
+    encryption_enabled: bool = False
+    encryption_key_env: str = "CAMVAULT_ARCHIVE_KEY"
+    encryption_chunk_kb: int = Field(default=1024, ge=64, le=8192)
     verify_tls: bool = True
     connect_timeout_seconds: float = Field(default=10.0, ge=1.0, le=300.0)
     request_timeout_seconds: float = Field(default=300.0, ge=5.0, le=7200.0)
@@ -128,6 +135,35 @@ class WebDAVConfig(BaseModel):
             if value is not None:
                 return value
         return self.password
+
+    def resolved_encryption_key_text(self) -> str | None:
+        if not self.encryption_key_env:
+            return None
+        value = os.getenv(self.encryption_key_env)
+        return value.strip() if value else None
+
+    def resolved_encryption_key(self) -> bytes | None:
+        encoded = self.resolved_encryption_key_text()
+        if encoded is None:
+            return None
+        try:
+            key = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(
+                f"{self.encryption_key_env} must contain one Base64-encoded 32-byte key"
+            ) from exc
+        if len(key) != 32:
+            raise ValueError(
+                f"{self.encryption_key_env} must contain one Base64-encoded 32-byte key"
+            )
+        return key
+
+    @field_validator("encryption_chunk_kb")
+    @classmethod
+    def validate_encryption_chunk_kb(cls, value: int) -> int:
+        if value & (value - 1):
+            raise ValueError("webdav.encryption_chunk_kb must be a power of two")
+        return value
 
 
 class StorageConfig(BaseModel):
@@ -356,6 +392,16 @@ class AppConfig(BaseModel):
                     "CAMVAULT_WEBDAV_USERNAME/CAMVAULT_WEBDAV_PASSWORD or configure the "
                     "corresponding storage.webdav username/password fields."
                 )
+            if self.storage.webdav.encryption_enabled:
+                try:
+                    encryption_key = self.storage.webdav.resolved_encryption_key()
+                except ValueError as exc:
+                    raise ValueError(str(exc)) from exc
+                if encryption_key is None:
+                    raise ValueError(
+                        "WebDAV archive encryption is enabled, but "
+                        f"{self.storage.webdav.encryption_key_env} is not set"
+                    )
 
 
 def parse_config_text(

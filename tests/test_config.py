@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import pytest
@@ -119,3 +120,36 @@ def test_storage_root_cannot_be_filesystem_root() -> None:
 def test_webdav_url_rejects_embedded_credentials() -> None:
     with pytest.raises(ValidationError, match="must not contain credentials"):
         WebDAVConfig(url="http://user:secret@127.0.0.1:5244/dav")
+
+
+def test_webdav_archive_encryption_requires_a_32_byte_environment_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    webdav = WebDAVConfig(
+        username="camvault",
+        username_env=None,
+        password="secret",
+        password_env=None,
+        encryption_enabled=True,
+        encryption_key_env="CAMVAULT_TEST_ARCHIVE_KEY",
+    )
+    config = AppConfig(
+        storage=StorageConfig(backend="webdav", min_free_gb=0, webdav=webdav),
+        cameras=[CameraConfig(id="one", rtsp_url="rtsp://192.0.2.1/x")],
+    )
+
+    with pytest.raises(ValueError, match="CAMVAULT_TEST_ARCHIVE_KEY is not set"):
+        config.validate_runtime_security()
+
+    monkeypatch.setenv("CAMVAULT_TEST_ARCHIVE_KEY", base64.b64encode(b"short").decode())
+    with pytest.raises(ValueError, match="Base64-encoded 32-byte key"):
+        config.validate_runtime_security()
+
+    monkeypatch.setenv("CAMVAULT_TEST_ARCHIVE_KEY", base64.b64encode(bytes(range(32))).decode())
+    config.validate_runtime_security()
+    assert webdav.resolved_encryption_key() == bytes(range(32))
+
+
+def test_webdav_encryption_chunk_size_must_be_power_of_two() -> None:
+    with pytest.raises(ValidationError, match="power of two"):
+        WebDAVConfig(encryption_chunk_kb=1000)

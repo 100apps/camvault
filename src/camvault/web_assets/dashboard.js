@@ -239,16 +239,17 @@
 
       const capacity = data.storage.capacity || {};
       const managed = capacity.managed_archive_bytes;
+      const protection = data.storage.encryption?.enabled ? " · AES-256-GCM 已加密" : "";
       if (capacity.total_bytes !== null && capacity.total_bytes !== undefined) {
         const percent = capacity.total_bytes > 0
           ? Math.min(100, capacity.used_bytes / capacity.total_bytes * 100)
           : 0;
         $("storageUsage").textContent = `${percent.toFixed(1)}%`;
-        $("storageDetail").textContent = `${humanBytes(capacity.used_bytes)} 已用 · ${humanBytes(capacity.free_bytes)} 可用 · ${data.storage.backend.toUpperCase()}`;
+        $("storageDetail").textContent = `${humanBytes(capacity.used_bytes)} 已用 · ${humanBytes(capacity.free_bytes)} 可用 · ${data.storage.backend.toUpperCase()}${protection}`;
         $("storageMeter").style.width = `${percent}%`;
       } else {
         $("storageUsage").textContent = humanBytes(managed);
-        $("storageDetail").textContent = `CamVault 归档 · ${data.storage.backend.toUpperCase()} 未提供总配额`;
+        $("storageDetail").textContent = `CamVault 归档 · ${data.storage.backend.toUpperCase()} 未提供总配额${protection}`;
         $("storageMeter").style.width = "0";
       }
 

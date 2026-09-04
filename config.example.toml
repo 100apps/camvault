@@ -55,6 +55,12 @@ url = "http://127.0.0.1:5244/dav"
 root = "/CamVault"
 username_env = "CAMVAULT_WEBDAV_USERNAME"
 password_env = "CAMVAULT_WEBDAV_PASSWORD"
+# Encrypt video and metadata before they leave this machine. The key must be exactly
+# 32 random bytes encoded as Base64 and supplied only through the named environment variable.
+encryption_enabled = true
+encryption_key_env = "CAMVAULT_ARCHIVE_KEY"
+# 1 MiB authenticated chunks preserve efficient Range playback without whole-file buffering.
+encryption_chunk_kb = 1024
 verify_tls = true
 connect_timeout_seconds = 10
 request_timeout_seconds = 900

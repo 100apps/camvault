@@ -180,6 +180,7 @@ def config_secrets(config: AppConfig) -> tuple[str, ...]:
         config.server.resolved_playback_token(),
         config.server.resolved_web_password(),
         config.storage.webdav.resolved_password(),
+        config.storage.webdav.resolved_encryption_key_text(),
     ]
     for camera in config.cameras:
         values.extend(

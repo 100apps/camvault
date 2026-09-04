@@ -8,7 +8,7 @@ CamVault 是一个面向家庭多摄像头、7×24 运行的 ONVIF/RTSP 录像�
 - HLS 小分片经回环 HTTP PUT 进入有界 RAM，不先落大量临时小文件。
 - 可选两种归档后端：
   - `local`：内存聚合后，大文件顺序写 HDD/SSD/NAS 挂载目录；
-  - `webdav`：内存聚合后直接流式 PUT 到 AList/WebDAV，不建立本地媒体 spool。
+  - `webdav`：内存聚合后先做 AES-256-GCM 加密，再流式 PUT 到 AList/WebDAV，不建立本地媒体 spool。
 - 录像按 `摄像头/年/月/日/小时` 分区，包含 SHA-256 和分片音量索引 JSON 侧车。
 - 提供密码登录的专业多摄像头控制台、主码流直播、倍速回放、按时间与摄像头导出 MP4、带声音活动标记的连续历史时间轴、配置编辑、诊断日志和状态 API。
 - 控制台展示本地/WebDAV 容量、CamVault 归档量、最近 60 秒写入量及每路码率。
@@ -34,7 +34,7 @@ ONVIF GetProfiles / GetStreamUri
                   ┌─────────┴─────────┐
                   ▼                   ▼
             local 后端           webdav 后端
-       .partial -> rename     PUT transaction -> MOVE
+       .partial -> rename     AES-GCM -> PUT -> MOVE
                   │                   │
                   ▼                   ▼
         本地 HDD/SSD/NAS       AList -> 远程网盘
@@ -73,7 +73,7 @@ ffprobe -version
 ### Linux / macOS
 
 ```bash
-unzip camvault-0.7.0.zip
+unzip camvault-0.8.0.zip
 cd camvault
 uv sync
 uv run camvault init
@@ -93,7 +93,7 @@ uv run camvault serve -c config.toml
 ### Windows PowerShell
 
 ```powershell
-Expand-Archive .\camvault-0.7.0.zip -DestinationPath .
+Expand-Archive .\camvault-0.8.0.zip -DestinationPath .
 Set-Location .\camvault
 uv sync
 uv run camvault init
@@ -238,6 +238,8 @@ CamVault 0.2 能继续识别和播放 0.1 生成的旧文件名。
 ```bash
 export CAMVAULT_WEBDAV_USERNAME='camvault'
 export CAMVAULT_WEBDAV_PASSWORD='强密码'
+# 只生成一次，并安全备份；丢失后无法恢复网盘上的加密录像。
+export CAMVAULT_ARCHIVE_KEY="$(openssl rand -base64 32)"
 ```
 
 ```toml
@@ -256,6 +258,10 @@ url = "http://127.0.0.1:5244/dav"
 root = "/Cloud/CamVault"
 username_env = "CAMVAULT_WEBDAV_USERNAME"
 password_env = "CAMVAULT_WEBDAV_PASSWORD"
+encryption_enabled = true
+encryption_key_env = "CAMVAULT_ARCHIVE_KEY"
+# 1 MiB 分块兼顾认证边界、Range 回放和内存占用。
+encryption_chunk_kb = 1024
 verify_tls = true
 connect_timeout_seconds = 10
 request_timeout_seconds = 900
@@ -266,7 +272,15 @@ max_index_response_mb = 64
 index_cache_entries = 128
 ```
 
-WebDAV URL 禁止内嵌账号密码，避免凭据进入日志或异常信息。
+WebDAV URL 禁止内嵌账号密码，避免凭据进入日志或异常信息。启用加密后，新媒体和 JSON
+侧车会在离开 CamVault 前按块使用 AES-256-GCM 加密并认证，以 `.ts.enc` / `.json.enc`
+提交到网盘；直播、历史 Range 回放和 MP4 导出由服务端透明解密。旧的明文 `.ts` 仍可播放，
+但不会自动迁移，应等待保留策略淘汰或另行离线迁移。
+
+加密密钥必须是 32 个随机字节的 Base64，不得写进 `config.toml`、Git、AList 或同一网盘。
+生产部署应放在权限为 `600` 的 `/data/camvault/secrets.env` 并另做离线备份。密钥丢失后，
+CamVault 和网盘服务商都无法恢复加密录像。远端仍会看到目录、摄像头 ID、录像时间、时长、
+大小和声音活动位图；加密保护的是媒体/侧车内容和完整性，不提供文件名匿名化。
 
 ### 6.3 上线前强制检查
 
@@ -567,6 +581,12 @@ ffmpeg_loglevel = "error"
 ffprobe 确认为源分辨率和源帧率。若页面提示浏览器不能解码原码，再改用
 `video_codec="h264"`；软件转码兼容面更大，但不适合这类低功耗路由器长期运行。
 
+同一台 N5105 的 CPU flags 包含 AES-NI 和 PCLMULQDQ。AES-256-GCM 的 OpenSSL 实测吞吐
+约 2.58 GB/s，CamVault 实际 Python 加密路径约 1,134.5 MiB/s。启用上传前加密后的 55 秒
+正式采样（覆盖两路媒体与侧车上传）中，CamVault + 两路 FFmpeg 占整机 CPU 容量 1.332%、
+RSS 106.9 MiB；未加密声音索引基线为 1.27% / 95.1 MiB。加密增加约 0.06 个整机 CPU
+百分点和 11.8 MiB RSS，远低于视频转码成本。
+
 OpenWrt 软件源中的精简 FFmpeg 可能显式禁用 `h264`/`hevc` 解码器、解析器或 `libx264`。
 这不是摄像头配置问题。把完整静态版 `ffmpeg`、`ffprobe` 放到持久化目录（例如
 `/data/camvault/bin/`），配置绝对路径后运行 `camvault doctor` 和 `camera-check`：
@@ -590,8 +610,9 @@ audio_codec = "aac"
 4. 不把 CamVault 8088 或 AList 5244 直接暴露公网；使用 WireGuard/Tailscale 或 HTTPS 反代；
 5. 默认关闭 Uvicorn access log；浏览器登录不把凭据放在查询参数中；
 6. FFmpeg 通过进程参数接收 RTSP URL，本机管理员仍可能查看凭据；
-7. 录像本身不加密；本地盘使用 BitLocker/FileVault/LUKS，远端依赖网盘加密模型；
-8. 密码登录和 API Token 都不是 TLS，同网段明文 HTTP 仍可能被窃听。
+7. WebDAV 新录像启用分块 AES-256-GCM；本地盘仍使用 BitLocker/FileVault/LUKS；
+8. 将 `CAMVAULT_ARCHIVE_KEY` 离线备份，绝不上传到同一网盘；
+9. 密码登录和 API Token 都不是 TLS，同网段明文 HTTP 仍可能被窃听。
 
 详见 [`SECURITY.md`](SECURITY.md)。
 
@@ -636,6 +657,7 @@ uv build --offline
 - HTTP `Content-Length` 和分片流式请求体；
 - 失败时不创建本地 fallback；
 - WebDAV Range 206/416 代理；
+- WebDAV AES-256-GCM 上传前加密、逐块防篡改校验和密文 Range 映射；
 - 远端保留策略与事务清理；
 - CamVault 0.1 文件名兼容。
 

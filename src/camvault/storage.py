@@ -5,10 +5,11 @@ import email.utils
 import hashlib
 import json
 import logging
+import re
 import secrets
 import shutil
 import time
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -28,6 +29,19 @@ from camvault.archive import (
     write_archive_batch,
 )
 from camvault.config import StorageConfig, WebDAVConfig
+from camvault.crypto import (
+    ARCHIVE_ENCRYPTION_ALGORITHM,
+    ARCHIVE_ENCRYPTION_HEADER_BYTES,
+    ARCHIVE_ENCRYPTION_TAG_BYTES,
+    ArchiveEncryptionError,
+    ArchiveEncryptionHeader,
+    decrypt_archive_chunk,
+    encrypt_archive_chunks,
+    encrypted_size,
+    encrypted_span_for_plaintext_range,
+    parse_encryption_header,
+    plaintext_chunk_size,
+)
 from camvault.retention import RetentionResult, apply_retention
 
 logger = logging.getLogger(__name__)
@@ -38,6 +52,52 @@ _PROPFIND_BODY = b"""<?xml version="1.0" encoding="utf-8"?>
   <d:resourcetype/><d:getcontentlength/><d:getlastmodified/>
   <d:getetag/><d:quota-available-bytes/><d:quota-used-bytes/>
 </d:prop></d:propfind>"""
+
+
+def _archive_sidecar_path(media_path: str) -> str:
+    if media_path.endswith(".ts.enc"):
+        return f"{media_path[:-7]}.json.enc"
+    return str(PurePosixPath(media_path).with_suffix(".json"))
+
+
+def _resolve_byte_range(value: str | None, size: int) -> tuple[int, int, int] | None:
+    if size <= 0:
+        return None
+    if value is None:
+        return 200, 0, size - 1
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", value.strip())
+    if match is None or (not match.group(1) and not match.group(2)):
+        return None
+    if match.group(1):
+        start = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) else size - 1
+        if start >= size or end < start:
+            return None
+        return 206, start, min(end, size - 1)
+    suffix_size = int(match.group(2))
+    if suffix_size <= 0:
+        return None
+    return 206, max(0, size - suffix_size), size - 1
+
+
+async def _empty_remote_body() -> AsyncIterator[bytes]:
+    if False:
+        yield b""
+
+
+async def _no_remote_close() -> None:
+    return None
+
+
+async def _iter_http_response(
+    response: httpx.Response, *, chunk_size: int = 128 * 1024
+) -> AsyncIterator[bytes]:
+    if response.is_stream_consumed:
+        if response.content:
+            yield response.content
+        return
+    async for chunk in response.aiter_raw(chunk_size=chunk_size):
+        yield chunk
 
 
 class StorageBackendError(RuntimeError):
@@ -54,14 +114,14 @@ class StorageHealth:
 
 @dataclass(slots=True)
 class RemoteRead:
-    response: httpx.Response
+    status_code: int
+    headers: dict[str, str]
+    body: AsyncIterator[bytes]
+    close_callback: Callable[[], Awaitable[None]]
+    _closed: bool = False
 
-    @property
-    def status_code(self) -> int:
-        return self.response.status_code
-
-    @property
-    def headers(self) -> dict[str, str]:
+    @classmethod
+    def from_response(cls, response: httpx.Response) -> RemoteRead:
         allowed = {
             "content-length",
             "content-range",
@@ -70,20 +130,21 @@ class RemoteRead:
             "last-modified",
             "content-type",
         }
-        return {key: value for key, value in self.response.headers.items() if key in allowed}
+        headers = {key: value for key, value in response.headers.items() if key in allowed}
+        return cls(
+            status_code=response.status_code,
+            headers=headers,
+            body=_iter_http_response(response),
+            close_callback=response.aclose,
+        )
 
     def iter_bytes(self) -> AsyncIterator[bytes]:
-        if self.response.is_stream_consumed:
-
-            async def loaded() -> AsyncIterator[bytes]:
-                if self.response.content:
-                    yield self.response.content
-
-            return loaded()
-        return self.response.aiter_raw(chunk_size=128 * 1024)
+        return self.body
 
     async def close(self) -> None:
-        await self.response.aclose()
+        if not self._closed:
+            self._closed = True
+            await self.close_callback()
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,7 +353,7 @@ class WebDAVStorageBackend(StorageBackend):
             ),
             verify=self.config.verify_tls,
             follow_redirects=True,
-            headers={"User-Agent": "CamVault/0.7.0", "Accept-Encoding": "identity"},
+            headers={"User-Agent": "CamVault/0.8.0", "Accept-Encoding": "identity"},
         )
 
     @property
@@ -354,10 +415,15 @@ class WebDAVStorageBackend(StorageBackend):
 
     async def write_batch(self, batch: ArchiveBatch) -> ArchiveRecord:
         await self.start()
-        relative = archive_relative_path(batch, self.storage)
+        plain_relative = archive_relative_path(batch, self.storage)
+        encryption_key = (
+            self.config.resolved_encryption_key() if self.config.encryption_enabled else None
+        )
+        encrypted = encryption_key is not None
+        relative = f"{plain_relative}.enc" if encrypted else plain_relative
         camera_relative = PurePosixPath(batch.camera_id, relative).as_posix()
         media_path = camera_relative
-        metadata_path = str(PurePosixPath(camera_relative).with_suffix(".json"))
+        metadata_path = _archive_sidecar_path(camera_relative)
         media_partial = _partial_name(media_path)
         metadata_partial = _partial_name(metadata_path)
         directory_parts = (*self._root_parts, *PurePosixPath(camera_relative).parent.parts)
@@ -378,6 +444,7 @@ class WebDAVStorageBackend(StorageBackend):
             segment_count=len(batch.segments),
             stream_id=batch.stream_id,
             audio_index=batch.audio_index,
+            encrypted=encrypted,
         )
         metadata = record.as_dict() | {
             "format": "mpegts",
@@ -388,34 +455,65 @@ class WebDAVStorageBackend(StorageBackend):
         }
         metadata_bytes = (json.dumps(metadata, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
+        if encrypted:
+            assert encryption_key is not None
+            encryption_chunk_size = self.config.encryption_chunk_kb * 1024
+            media_chunks: Iterable[bytes] = encrypt_archive_chunks(
+                (segment.data for segment in batch.segments),
+                plaintext_size=batch.size_bytes,
+                chunk_size=encryption_chunk_size,
+                key=encryption_key,
+                context=media_path,
+            )
+            media_content_length = encrypted_size(batch.size_bytes, encryption_chunk_size)
+            metadata_chunks: Iterable[bytes] = encrypt_archive_chunks(
+                (metadata_bytes,),
+                plaintext_size=len(metadata_bytes),
+                chunk_size=encryption_chunk_size,
+                key=encryption_key,
+                context=metadata_path,
+            )
+            metadata_content_length = encrypted_size(len(metadata_bytes), encryption_chunk_size)
+            media_content_type = "application/octet-stream"
+            metadata_content_type = "application/octet-stream"
+        else:
+            media_chunks = (segment.data for segment in batch.segments)
+            media_content_length = batch.size_bytes
+            metadata_chunks = (metadata_bytes,)
+            metadata_content_length = len(metadata_bytes)
+            media_content_type = "video/mp2t"
+            metadata_content_type = "application/json; charset=utf-8"
+
         try:
             if self.config.atomic_upload:
                 await self._put(
                     media_partial,
-                    (segment.data for segment in batch.segments),
-                    batch.size_bytes,
-                    "video/mp2t",
+                    media_chunks,
+                    media_content_length,
+                    media_content_type,
+                    track_media=True,
                 )
                 await self._move(media_partial, media_path)
                 await self._put(
                     metadata_partial,
-                    (metadata_bytes,),
-                    len(metadata_bytes),
-                    "application/json; charset=utf-8",
+                    metadata_chunks,
+                    metadata_content_length,
+                    metadata_content_type,
                 )
                 await self._move(metadata_partial, metadata_path)
             else:
                 await self._put(
                     media_path,
-                    (segment.data for segment in batch.segments),
-                    batch.size_bytes,
-                    "video/mp2t",
+                    media_chunks,
+                    media_content_length,
+                    media_content_type,
+                    track_media=True,
                 )
                 await self._put(
                     metadata_path,
-                    (metadata_bytes,),
-                    len(metadata_bytes),
-                    "application/json; charset=utf-8",
+                    metadata_chunks,
+                    metadata_content_length,
+                    metadata_content_type,
                 )
         except Exception:
             # Never spool to local disk on retry. Only remove remote transaction objects;
@@ -473,6 +571,14 @@ class WebDAVStorageBackend(StorageBackend):
         await self.start()
         relative = _safe_recording_relative(relative_path)
         remote_path = PurePosixPath(camera_id, *relative.parts).as_posix()
+        if relative_path.endswith(".ts.enc"):
+            return await self._open_encrypted_recording(remote_path, range_header)
+        response = await self._open_remote_response(remote_path, range_header)
+        return RemoteRead.from_response(response)
+
+    async def _open_remote_response(
+        self, remote_path: str, range_header: str | None
+    ) -> httpx.Response:
         headers = {"Accept-Encoding": "identity"}
         if range_header:
             headers["Range"] = range_header
@@ -483,14 +589,168 @@ class WebDAVStorageBackend(StorageBackend):
             raise StorageBackendError(f"WebDAV GET failed: {type(exc).__name__}: {exc}") from exc
         if response.status_code == 404:
             await response.aclose()
-            raise FileNotFoundError(relative_path)
+            raise FileNotFoundError(remote_path)
         # Preserve 416 so CamVault behaves like a transparent range proxy. Converting it
         # to 502 makes media players retry the wrong failure class.
         if response.status_code not in {200, 206, 416}:
             status = response.status_code
             await response.aclose()
             raise StorageBackendError(f"WebDAV GET returned HTTP {status}")
-        return RemoteRead(response)
+        return response
+
+    async def _open_encrypted_recording(
+        self, remote_path: str, range_header: str | None
+    ) -> RemoteRead:
+        try:
+            key = self.config.resolved_encryption_key()
+        except ValueError as exc:
+            raise StorageBackendError(str(exc)) from exc
+        if key is None:
+            raise StorageBackendError(
+                "encrypted WebDAV archive cannot be opened because its key is unavailable"
+            )
+
+        header_response = await self._open_remote_response(
+            remote_path, f"bytes=0-{ARCHIVE_ENCRYPTION_HEADER_BYTES - 1}"
+        )
+        try:
+            if header_response.status_code == 416:
+                raise StorageBackendError("encrypted WebDAV archive is missing its header")
+            header_bytes = bytearray()
+            async for chunk in _iter_http_response(
+                header_response, chunk_size=ARCHIVE_ENCRYPTION_HEADER_BYTES
+            ):
+                needed = ARCHIVE_ENCRYPTION_HEADER_BYTES - len(header_bytes)
+                header_bytes.extend(chunk[:needed])
+                if len(header_bytes) == ARCHIVE_ENCRYPTION_HEADER_BYTES:
+                    break
+            try:
+                header = parse_encryption_header(bytes(header_bytes))
+            except ArchiveEncryptionError as exc:
+                raise StorageBackendError(str(exc)) from exc
+        finally:
+            await header_response.aclose()
+
+        selected = _resolve_byte_range(range_header, header.plaintext_size)
+        if selected is None:
+            return RemoteRead(
+                status_code=416,
+                headers={
+                    "content-range": f"bytes */{header.plaintext_size}",
+                    "content-length": "0",
+                    "accept-ranges": "bytes",
+                },
+                body=_empty_remote_body(),
+                close_callback=_no_remote_close,
+            )
+        status_code, plain_start, plain_end = selected
+        first_chunk, last_chunk, stored_start, stored_end = encrypted_span_for_plaintext_range(
+            header, plain_start, plain_end
+        )
+        data_response = await self._open_remote_response(
+            remote_path, f"bytes={stored_start}-{stored_end}"
+        )
+        if data_response.status_code == 416:
+            await data_response.aclose()
+            raise StorageBackendError("encrypted WebDAV archive is truncated")
+        source_skip = stored_start if data_response.status_code == 200 else 0
+        if data_response.status_code == 206:
+            content_range = data_response.headers.get("content-range", "")
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(?:\d+|\*)", content_range)
+            if match is None or int(match.group(1)) != stored_start:
+                await data_response.aclose()
+                raise StorageBackendError("WebDAV returned an invalid encrypted byte range")
+
+        body = self._decrypt_remote_range(
+            response=data_response,
+            header=header,
+            key=key,
+            context=remote_path,
+            first_chunk=first_chunk,
+            last_chunk=last_chunk,
+            stored_bytes=stored_end - stored_start + 1,
+            source_skip=source_skip,
+            plain_start=plain_start,
+            plain_end=plain_end,
+        )
+        response_headers = {
+            "content-length": str(plain_end - plain_start + 1),
+            "accept-ranges": "bytes",
+            "content-type": "video/mp2t",
+        }
+        if status_code == 206:
+            response_headers["content-range"] = (
+                f"bytes {plain_start}-{plain_end}/{header.plaintext_size}"
+            )
+        if "last-modified" in data_response.headers:
+            response_headers["last-modified"] = data_response.headers["last-modified"]
+        return RemoteRead(
+            status_code=status_code,
+            headers=response_headers,
+            body=body,
+            close_callback=data_response.aclose,
+        )
+
+    async def _decrypt_remote_range(
+        self,
+        *,
+        response: httpx.Response,
+        header: ArchiveEncryptionHeader,
+        key: bytes,
+        context: str,
+        first_chunk: int,
+        last_chunk: int,
+        stored_bytes: int,
+        source_skip: int,
+        plain_start: int,
+        plain_end: int,
+    ) -> AsyncIterator[bytes]:
+        pending = bytearray()
+        remaining = stored_bytes
+        chunk_index = first_chunk
+        try:
+            async for source in _iter_http_response(response):
+                if source_skip:
+                    skipped = min(source_skip, len(source))
+                    source_skip -= skipped
+                    source = source[skipped:]
+                    if not source:
+                        continue
+                accepted = source[:remaining]
+                pending.extend(accepted)
+                remaining -= len(accepted)
+                while chunk_index <= last_chunk:
+                    cipher_size = (
+                        plaintext_chunk_size(header, chunk_index) + ARCHIVE_ENCRYPTION_TAG_BYTES
+                    )
+                    if len(pending) < cipher_size:
+                        break
+                    encrypted_chunk = bytes(pending[:cipher_size])
+                    del pending[:cipher_size]
+                    try:
+                        plaintext = decrypt_archive_chunk(
+                            encrypted_chunk,
+                            header=header,
+                            index=chunk_index,
+                            key=key,
+                            context=context,
+                        )
+                    except ArchiveEncryptionError as exc:
+                        raise StorageBackendError(str(exc)) from exc
+                    chunk_plain_start = chunk_index * header.chunk_size
+                    selected_start = max(0, plain_start - chunk_plain_start)
+                    selected_end = min(len(plaintext), plain_end - chunk_plain_start + 1)
+                    if selected_start < selected_end:
+                        yield plaintext[selected_start:selected_end]
+                    chunk_index += 1
+                if remaining == 0:
+                    break
+        except httpx.HTTPError as exc:
+            raise StorageBackendError(
+                f"WebDAV encrypted GET failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        if source_skip or remaining or pending or chunk_index <= last_chunk:
+            raise StorageBackendError("encrypted WebDAV archive is truncated")
 
     async def retention(
         self,
@@ -519,7 +779,7 @@ class WebDAVStorageBackend(StorageBackend):
                 return
             remote = PurePosixPath(record.camera_id, record.relative_path).as_posix()
             await self._delete(remote, ignore_missing=True)
-            await self._delete(str(PurePosixPath(remote).with_suffix(".json")), ignore_missing=True)
+            await self._delete(_archive_sidecar_path(remote), ignore_missing=True)
             deleted_paths.add(key)
             deleted_files += 1
             deleted_bytes += record.size_bytes
@@ -532,7 +792,9 @@ class WebDAVStorageBackend(StorageBackend):
         )
         for camera_id, entries in entries_by_camera.items():
             sidecars = {
-                entry.relative_path for entry in entries if entry.relative_path.endswith(".json")
+                entry.relative_path
+                for entry in entries
+                if entry.relative_path.endswith((".json", ".json.enc"))
             }
             for entry in entries:
                 if entry.is_dir or entry.modified is None or entry.modified >= stale_cutoff:
@@ -542,9 +804,9 @@ class WebDAVStorageBackend(StorageBackend):
                 if name.endswith(".camvault-partial"):
                     await self._delete(remote, ignore_missing=True)
                     continue
-                if entry.relative_path.endswith(".ts"):
+                if entry.relative_path.endswith((".ts", ".ts.enc")):
                     parsed = parse_archive_filename(name)
-                    expected_sidecar = str(PurePosixPath(entry.relative_path).with_suffix(".json"))
+                    expected_sidecar = _archive_sidecar_path(entry.relative_path)
                     if parsed is not None and expected_sidecar not in sidecars:
                         await self._delete(remote, ignore_missing=True)
                         self._invalidate_camera(camera_id)
@@ -635,6 +897,20 @@ class WebDAVStorageBackend(StorageBackend):
             "atomic_upload": self.config.atomic_upload,
             "local_media_spool": False,
             "credential_source": "environment/config (not exposed)",
+            "encryption": {
+                "enabled": self.config.encryption_enabled,
+                "algorithm": (
+                    ARCHIVE_ENCRYPTION_ALGORITHM if self.config.encryption_enabled else None
+                ),
+                "chunk_bytes": (
+                    self.config.encryption_chunk_kb * 1024
+                    if self.config.encryption_enabled
+                    else None
+                ),
+                "key_source": (
+                    "environment (not exposed)" if self.config.encryption_enabled else None
+                ),
+            },
             "capacity": {
                 "source": (
                     "webdav-quota" if self._quota_available_cache is not None else "camvault-index"
@@ -673,16 +949,18 @@ class WebDAVStorageBackend(StorageBackend):
         self, camera_id: str, entries: list[WebDAVEntry]
     ) -> list[ArchiveRecord]:
         sidecars = {
-            entry.relative_path for entry in entries if entry.relative_path.endswith(".json")
+            entry.relative_path
+            for entry in entries
+            if entry.relative_path.endswith((".json", ".json.enc"))
         }
         prefix = f"{camera_id}/"
         records: list[ArchiveRecord] = []
         for entry in entries:
             if entry.is_dir or not entry.relative_path.startswith(prefix):
                 continue
-            if not entry.relative_path.endswith(".ts"):
+            if not entry.relative_path.endswith((".ts", ".ts.enc")):
                 continue
-            sidecar = str(PurePosixPath(entry.relative_path).with_suffix(".json"))
+            sidecar = _archive_sidecar_path(entry.relative_path)
             if sidecar not in sidecars:
                 continue
             relative = entry.relative_path[len(prefix) :]
@@ -703,6 +981,7 @@ class WebDAVStorageBackend(StorageBackend):
                     size_bytes=entry.size_bytes,
                     stream_id=parsed.stream_id,
                     audio_index=parsed.audio_index,
+                    encrypted=parsed.encrypted,
                 )
             )
         records.sort(key=lambda record: record.start)
@@ -744,6 +1023,8 @@ class WebDAVStorageBackend(StorageBackend):
         chunks: Iterable[bytes],
         content_length: int,
         content_type: str,
+        *,
+        track_media: bool = False,
     ) -> None:
         source_chunks = 0
 
@@ -771,7 +1052,7 @@ class WebDAVStorageBackend(StorageBackend):
             headers={"Content-Type": content_type, "Content-Length": str(content_length)},
             content=body(),
         )
-        if content_type == "video/mp2t":
+        if track_media:
             self._last_media_upload_source_chunks = source_chunks
         await response.aclose()
 
@@ -940,7 +1221,7 @@ def _safe_recording_relative(value: str) -> PurePosixPath:
         path = _safe_webdav_relative(value)
     except ValueError as exc:
         raise ValueError("invalid recording path") from exc
-    if not path.parts or path.suffix.lower() != ".ts" or len(path.parts) != 5:
+    if not path.parts or not value.lower().endswith((".ts", ".ts.enc")) or len(path.parts) != 5:
         raise ValueError("only partitioned MPEG-TS recording files may be served")
     if parse_archive_filename(path.name) is None:
         raise ValueError("invalid CamVault recording filename")
@@ -965,9 +1246,9 @@ def _filter_records(
     start = _utc_or_none(start)
     end = _utc_or_none(end)
     if start is not None:
-        records = [record for record in records if record.end >= start]
+        records = [record for record in records if record.end > start]
     if end is not None:
-        records = [record for record in records if record.start <= end]
+        records = [record for record in records if record.start < end]
     records.sort(key=lambda record: record.start)
     if limit is not None and len(records) > limit:
         records = records[-limit:]

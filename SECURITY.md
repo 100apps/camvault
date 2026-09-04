@@ -4,11 +4,12 @@ CamVault is intended for a trusted home LAN or a private overlay network.
 
 ## Secrets
 
-- Prefer `password_env`, `username_env`, `rtsp_url_env`, `web_password_env`, `playback_token_env`, and the WebDAV credential environment variables.
+- Prefer `password_env`, `username_env`, `rtsp_url_env`, `web_password_env`, `playback_token_env`, and the WebDAV credential/archive-key environment variables.
 - Do not commit `config.toml`, `.env`, shell history containing secrets, or service files with plaintext credentials.
 - WebDAV URLs containing user information are rejected. CamVault keeps AList credentials server-side and never embeds them in browser playlists.
 - RTSP credentials are passed to FFmpeg in its process arguments. Logs redact them, but a privileged local account may inspect process arguments.
 - Rotate camera, AList and playback credentials if logs, shell history, task definitions, or backups may have exposed them.
+- `CAMVAULT_ARCHIVE_KEY` must contain 32 random bytes encoded as Base64. Keep an offline backup separate from the WebDAV provider; losing it permanently loses access to encrypted archives.
 
 ## Network exposure
 
@@ -28,6 +29,9 @@ CamVault is intended for a trusted home LAN or a private overlay network.
 
 ## WebDAV / AList backend
 
+- Enable `encryption_enabled = true`. New video and metadata objects are encrypted before upload with independently nonced, chunked AES-256-GCM; every decrypted chunk is authenticated before it is released to a player or export.
+- Encryption does not hide directory names, camera IDs, timestamps, durations, sizes or the compact audio-activity bitmap. It also does not protect a running CamVault host after root compromise, because that host necessarily holds the decryption key.
+- Existing plaintext `.ts` archives remain readable for compatibility and are not rewritten automatically. Treat them as plaintext until retention deletes them or they are migrated separately.
 - Create a dedicated least-privilege AList account restricted to the CamVault directory. It needs WebDAV read/manage plus create/upload, move/rename and delete capabilities.
 - Keep `atomic_upload = true` only when `camvault storage-check` succeeds against the real configured AList storage. Disabling it weakens incomplete-upload visibility guarantees.
 - `backend = "webdav"` means CamVault creates no local media spool. It does not guarantee that AList's selected cloud driver never uses `temp_dir`; place that directory on tmpfs/RAM disk when media must not touch SSD.

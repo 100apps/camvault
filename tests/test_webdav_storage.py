@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import email.utils
 import re
 from datetime import UTC, datetime, timedelta
@@ -20,6 +21,7 @@ from camvault.config import (
     StorageConfig,
     WebDAVConfig,
 )
+from camvault.crypto import ARCHIVE_ENCRYPTION_HEADER_BYTES, ARCHIVE_ENCRYPTION_MAGIC
 from camvault.service import CamVaultService
 from camvault.storage import StorageBackendError, WebDAVStorageBackend
 from camvault.web import create_app
@@ -71,7 +73,7 @@ class MemoryWebDAV:
             async for chunk in request.stream:
                 chunks.append(bytes(chunk))
             payload = b"".join(chunks)
-            if path.endswith(".ts.camvault-partial"):
+            if path.endswith((".ts.camvault-partial", ".ts.enc.camvault-partial")):
                 self.media_put_chunks.append(len(chunks))
                 self.media_put_content_lengths.append(request.headers.get("content-length"))
                 if self.fail_next_media_put:
@@ -94,7 +96,10 @@ class MemoryWebDAV:
                 return httpx.Response(409)
             self.files[destination] = self.files.pop(path)
             self.modified[destination] = self.modified.pop(path, datetime.now(UTC))
-            if path.endswith(".ts.camvault-partial") and self.commit_then_fail_next_media_move:
+            if (
+                path.endswith((".ts.camvault-partial", ".ts.enc.camvault-partial"))
+                and self.commit_then_fail_next_media_move
+            ):
                 self.commit_then_fail_next_media_move = False
                 return httpx.Response(500, text="commit succeeded but response was lost")
             return httpx.Response(201)
@@ -219,6 +224,26 @@ def _segment(
     )
 
 
+def _encrypted_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> StorageConfig:
+    monkeypatch.setenv(
+        "CAMVAULT_TEST_ARCHIVE_KEY", base64.b64encode(bytes(range(32))).decode("ascii")
+    )
+    return _storage(
+        tmp_path,
+        webdav=WebDAVConfig(
+            url="http://webdav.test/dav",
+            root="/Cloud/CamVault",
+            username="camvault",
+            username_env=None,
+            password="secret",
+            password_env=None,
+            encryption_enabled=True,
+            encryption_key_env="CAMVAULT_TEST_ARCHIVE_KEY",
+            encryption_chunk_kb=64,
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_webdav_streams_atomic_archive_without_creating_local_storage(
     tmp_path: Path,
@@ -266,6 +291,77 @@ async def test_webdav_streams_atomic_archive_without_creating_local_storage(
             assert b"".join([chunk async for chunk in remote.iter_bytes()]) == b"cdef"
         finally:
             await remote.close()
+    finally:
+        await backend.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_webdav_encrypts_before_upload_and_decrypts_bounded_ranges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = MemoryWebDAV()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(server))
+    storage = _encrypted_storage(tmp_path, monkeypatch)
+    backend = WebDAVStorageBackend(storage, ["front"], client=client)
+    start = datetime(2026, 9, 4, 12, 0, tzinfo=UTC)
+    payload = b"A" * 70_000 + b"B" * 70_000
+    batch = ArchiveBatch(camera_id="front", segments=(_segment(1, payload, start),))
+    try:
+        record = await backend.write_batch(batch)
+        assert record.encrypted is True
+        assert record.relative_path.endswith(".ts.enc")
+        assert record.size_bytes == len(payload)
+        assert not storage.root.exists()
+
+        remote_path = f"/dav/Cloud/CamVault/front/{record.relative_path}"
+        metadata_path = f"{remote_path[:-7]}.json.enc"
+        ciphertext = server.files[remote_path]
+        assert ciphertext.startswith(ARCHIVE_ENCRYPTION_MAGIC)
+        assert payload[:1024] not in ciphertext
+        assert server.files[metadata_path].startswith(ARCHIVE_ENCRYPTION_MAGIC)
+        assert b'"sha256"' not in server.files[metadata_path]
+
+        records = await backend.list_records(
+            "front", start=start - timedelta(seconds=1), end=start + timedelta(minutes=1)
+        )
+        assert len(records) == 1
+        assert records[0].encrypted is True
+
+        complete = await backend.open_remote_recording("front", record.relative_path, None)
+        assert complete is not None
+        try:
+            assert complete.status_code == 200
+            assert b"".join([chunk async for chunk in complete.iter_bytes()]) == payload
+        finally:
+            await complete.close()
+
+        ranged = await backend.open_remote_recording(
+            "front", record.relative_path, "bytes=65000-66000"
+        )
+        assert ranged is not None
+        try:
+            assert ranged.status_code == 206
+            assert ranged.headers["content-range"] == f"bytes 65000-66000/{len(payload)}"
+            assert b"".join([chunk async for chunk in ranged.iter_bytes()]) == payload[65000:66001]
+        finally:
+            await ranged.close()
+
+        tampered = bytearray(ciphertext)
+        tampered[ARCHIVE_ENCRYPTION_HEADER_BYTES + 100] ^= 1
+        server.files[remote_path] = bytes(tampered)
+        damaged = await backend.open_remote_recording("front", record.relative_path, "bytes=0-1023")
+        assert damaged is not None
+        try:
+            with pytest.raises(StorageBackendError, match="authentication failed"):
+                b"".join([chunk async for chunk in damaged.iter_bytes()])
+        finally:
+            await damaged.close()
+
+        encryption_status = backend.status()["encryption"]
+        assert encryption_status["enabled"] is True
+        assert encryption_status["algorithm"] == "AES-256-GCM"
+        assert "CAMVAULT_TEST_ARCHIVE_KEY" not in str(backend.status())
     finally:
         await backend.close()
         await client.aclose()
@@ -414,11 +510,11 @@ async def test_webdav_emergency_retention_deletes_oldest_first_with_cap(
 
 @pytest.mark.asyncio
 async def test_webdav_service_vod_proxies_range_without_exposing_credentials(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server = MemoryWebDAV()
     webdav_client = httpx.AsyncClient(transport=httpx.MockTransport(server))
-    storage = _storage(tmp_path)
+    storage = _encrypted_storage(tmp_path, monkeypatch)
     config = AppConfig(
         server=ServerConfig(host="127.0.0.1", playback_token="token", playback_token_env=None),
         storage=storage,
@@ -481,6 +577,7 @@ async def test_webdav_service_vod_proxies_range_without_exposing_credentials(
             assert status["storage"]["backend"] == "webdav"
             assert status["storage"]["diskless_media_path"] is True
             assert status["storage"]["local_media_spool"] is False
+            assert status["storage"]["encryption"]["algorithm"] == "AES-256-GCM"
             assert status["storage_root"] is None
             assert "secret" not in str(status)
             assert not storage.root.exists()

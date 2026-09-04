@@ -25,7 +25,7 @@ _ARCHIVE_FILENAME_RE = re.compile(
     r"(?P<duration>\d{9})ms_"
     r"(?P<stream>s(?:none|[0-9a-f]{12}))_"
     r"(?:(?P<audio_step>a\d{1,4})x(?P<audio_bits>[0-9a-f]{1,64})_)?"
-    r"(?P<object>[0-9a-f]{12})\.ts$"
+    r"(?P<object>[0-9a-f]{12})\.ts(?P<encrypted>\.enc)?$"
 )
 
 # CamVault 0.1 filenames did not include a stream tag or stable object id. Keep parsing
@@ -117,6 +117,7 @@ class ArchiveRecord:
     segment_count: int | None = None
     stream_id: str | None = None
     audio_index: tuple[AudioIndexPoint, ...] = ()
+    encrypted: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -130,6 +131,7 @@ class ArchiveRecord:
             "segment_count": self.segment_count,
             "stream_id": self.stream_id,
             "audio_index": [point.as_dict() for point in self.audio_index],
+            "encrypted": self.encrypted,
         }
 
 
@@ -141,6 +143,7 @@ class ParsedArchiveName:
     stream_id: str | None
     object_id: str
     audio_index: tuple[AudioIndexPoint, ...] = ()
+    encrypted: bool = False
 
 
 def _stream_tag(stream_id: str | None) -> str:
@@ -208,6 +211,7 @@ def parse_archive_filename(filename: str) -> ParsedArchiveName | None:
             stream_id=stream_id,
             object_id=match.group("object"),
             audio_index=audio_index,
+            encrypted=bool(not legacy and match.group("encrypted")),
         )
     except (ValueError, OverflowError):
         return None
@@ -520,6 +524,7 @@ def _record_from_metadata(
         ),
         stream_id=str(payload["stream_id"]) if payload.get("stream_id") is not None else None,
         audio_index=tuple(audio_index),
+        encrypted=bool(payload.get("encrypted", False)),
     )
 
 

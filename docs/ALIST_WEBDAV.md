@@ -13,6 +13,7 @@ CamVault 的 WebDAV 后端按以下媒体路径工作：
   -> 回环 HTTP PUT
   -> CamVault 有界 RAM
   -> RAM 中聚合成较大归档批次
+  -> 分块 AES-256-GCM 加密并认证
   -> WebDAV PUT 事务对象
   -> WebDAV MOVE 提交
   -> AList 存储驱动
@@ -128,6 +129,7 @@ AList 与 CamVault 在同一台机器时，应使用回环地址，不要绕外�
 ```bash
 export CAMVAULT_WEBDAV_USERNAME='camvault'
 export CAMVAULT_WEBDAV_PASSWORD='替换成强密码'
+export CAMVAULT_ARCHIVE_KEY="$(openssl rand -base64 32)"
 ```
 
 Windows PowerShell：
@@ -160,6 +162,9 @@ url = "http://127.0.0.1:5244/dav"
 root = "/Cloud/CamVault"
 username_env = "CAMVAULT_WEBDAV_USERNAME"
 password_env = "CAMVAULT_WEBDAV_PASSWORD"
+encryption_enabled = true
+encryption_key_env = "CAMVAULT_ARCHIVE_KEY"
+encryption_chunk_kb = 1024
 verify_tls = true
 connect_timeout_seconds = 10
 request_timeout_seconds = 900
@@ -174,6 +179,12 @@ max_index_response_mb = 64
 ```text
 http://user:password@127.0.0.1:5244/dav
 ```
+
+`CAMVAULT_ARCHIVE_KEY` 只生成一次，放在 root-only secrets 文件并另做离线备份，不得上传
+到同一网盘。新媒体和 JSON 侧车分别以 `.ts.enc` 和 `.json.enc` 保存；每个 1 MiB 块独立
+认证，播放器发起 Range 请求时 CamVault 只读取、验证并解密覆盖该范围的密文块。旧 `.ts`
+文件仍兼容播放但不会自动迁移。目录、摄像头 ID、时间、时长、大小和声音活动位图仍是可见
+元数据；该功能保护文件内容与完整性，不是文件名匿名化。
 
 ### 4.1 必须先运行存储协议检查
 
@@ -204,10 +215,10 @@ OPTIONS -> MKCOL -> PUT -> MOVE -> GET -> DELETE
 默认 `atomic_upload = true`：
 
 ```text
-PUT  xxx.ts.camvault-partial
-MOVE xxx.ts.camvault-partial -> xxx.ts
-PUT  xxx.json.camvault-partial
-MOVE xxx.json.camvault-partial -> xxx.json
+PUT  xxx.ts.enc.camvault-partial
+MOVE xxx.ts.enc.camvault-partial -> xxx.ts.enc
+PUT  xxx.json.enc.camvault-partial
+MOVE xxx.json.enc.camvault-partial -> xxx.json.enc
 ```
 
 播放列表只接受同时存在媒体和 JSON 侧车的对象，因此半成品不会进入回放索引。

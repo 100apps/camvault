@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.0 — 2026-09-04
+
+- Added upload-before-cloud, chunked AES-256-GCM encryption for WebDAV video and metadata.
+- Added authenticated, bounded-memory Range decryption so history playback and MP4 export
+  remain transparent without a plaintext disk spool or whole-file buffering.
+- Kept existing plaintext archives readable, isolated the 256-bit key in an environment
+  variable, exposed only non-secret encryption status and documented backup limitations.
+
 ## 0.7.0 — 2026-09-04
 
 - Added per-camera MP4 download for the time range selected on the history timeline.

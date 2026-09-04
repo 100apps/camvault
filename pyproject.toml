@@ -1,12 +1,13 @@
 [project]
 name = "camvault"
-version = "0.7.0"
+version = "0.8.0"
 description = "Cross-platform ONVIF/RTSP camera recorder with RAM-buffered HLS playback and pluggable local/WebDAV archive backends"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "CamVault contributors" }]
 dependencies = [
+  "cryptography>=46,<51",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "defusedxml>=0.7,<1",
