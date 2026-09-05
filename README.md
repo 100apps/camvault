@@ -2,6 +2,10 @@
 
 CamVault 是一个面向家庭多摄像头、7×24 运行的 ONVIF/RTSP 录像工具。
 
+当前主线版本为 **0.8.0**：WebDAV 录像与元数据在上传前使用分块 AES-256-GCM
+加密，历史回放和按时间导出仍由 CamVault 透明完成。既有明文录像保持可读，新产生的
+WebDAV 归档默认建议启用加密。
+
 - Python 3.11+，使用 `uv` 管理项目；Windows、macOS、Linux 共用一套代码。
 - 带用户名/密码的 ONVIF Media1/Media2 自动取流，也支持直接填写 RTSP URL。
 - 每台摄像头独立 FFmpeg、断流检测、指数退避重连和流边界标记。
@@ -73,7 +77,7 @@ ffprobe -version
 ### Linux / macOS
 
 ```bash
-unzip camvault-0.8.0.zip
+git clone https://github.com/100apps/camvault.git
 cd camvault
 uv sync
 uv run camvault init
@@ -81,6 +85,8 @@ uv run camvault init
 export CAMVAULT_WEB_PASSWORD='浏览器登录强密码'
 export CAMVAULT_WEBDAV_USERNAME='alist账号'
 export CAMVAULT_WEBDAV_PASSWORD='alist密码'
+# 仅首次部署生成一次；投入使用后不要重新生成或覆盖。
+export CAMVAULT_ARCHIVE_KEY="$(openssl rand -base64 32)"
 export CAMVAULT_LIVING_ROOM_PASSWORD='摄像头密码'
 export CAMVAULT_DOOR_PASSWORD='摄像头密码'
 
@@ -93,14 +99,18 @@ uv run camvault serve -c config.toml
 ### Windows PowerShell
 
 ```powershell
-Expand-Archive .\camvault-0.8.0.zip -DestinationPath .
-Set-Location .\camvault
+git clone https://github.com/100apps/camvault.git
+Set-Location camvault
 uv sync
 uv run camvault init
 
 $env:CAMVAULT_WEB_PASSWORD = '浏览器登录强密码'
 $env:CAMVAULT_WEBDAV_USERNAME = 'alist账号'
 $env:CAMVAULT_WEBDAV_PASSWORD = 'alist密码'
+# 仅首次部署生成一次；投入使用后不要重新生成或覆盖。
+$keyBytes = New-Object byte[] 32
+[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($keyBytes)
+$env:CAMVAULT_ARCHIVE_KEY = [Convert]::ToBase64String($keyBytes)
 $env:CAMVAULT_LIVING_ROOM_PASSWORD = '摄像头密码'
 $env:CAMVAULT_DOOR_PASSWORD = '摄像头密码'
 
@@ -109,6 +119,9 @@ uv run camvault camera-check -c .\config.toml --camera living_room
 uv run camvault self-test
 uv run camvault serve -c .\config.toml
 ```
+
+上面的归档密钥生成命令只适用于第一次部署。开始产生加密录像后，应把同一个值写入服务的
+受限 secrets 文件并另做离线备份；每次启动重新生成密钥会导致旧录像无法解密。
 
 `uv sync` 会生成/更新 `uv.lock`。首次同步完成后，7×24 服务模板使用
 `uv run --no-sync --no-dev`，避免重启时依赖外网。
@@ -221,7 +234,7 @@ recordings/
 5. 异常时清理事务残留。
 
 保留任务只删除带合法 CamVault 元数据侧车的媒体，不会把根目录中任意 `.ts` 当作受管文件。
-CamVault 0.2 能继续识别和播放 0.1 生成的旧文件名。
+当前版本仍能识别和播放 0.1 生成的旧文件名。
 
 ## 6. AList / WebDAV 存储后端
 
@@ -281,6 +294,15 @@ WebDAV URL 禁止内嵌账号密码，避免凭据进入日志或异常信息。
 生产部署应放在权限为 `600` 的 `/data/camvault/secrets.env` 并另做离线备份。密钥丢失后，
 CamVault 和网盘服务商都无法恢复加密录像。远端仍会看到目录、摄像头 ID、录像时间、时长、
 大小和声音活动位图；加密保护的是媒体/侧车内容和完整性，不提供文件名匿名化。
+
+每个远端对象使用独立的随机 nonce 基值，每个块带独立认证标签，并把对象路径、块序号、
+块长度和文件头绑定到认证数据。播放器请求 Range 时，CamVault 只下载并认证覆盖该范围的
+密文块；认证失败时拒绝输出，不会把被修改的视频交给播放器。默认 1 MiB 块只增加 32 字节
+文件头及每块 16 字节认证标签。
+
+当前格式使用单一归档密钥且不在文件头保存密钥副本或密钥 ID。不要直接替换正在使用的
+`CAMVAULT_ARCHIVE_KEY`：这样会立即失去对旧 `.enc` 文件的访问。需要轮换密钥时，应先
+保留旧密钥并完成独立迁移，再切换写入密钥。
 
 ### 6.3 上线前强制检查
 
@@ -624,8 +646,8 @@ audio_codec = "aac"
 - Windows：`deploy/windows/install-task.ps1`
 
 先手工执行 `uv sync --no-dev`，再用 `uv run --no-sync --no-dev` 启动。服务环境中需要同时
-提供摄像头密码、网页登录密码，以及 WebDAV 模式下的账号密码；外部播放器/API 如需使用
-再额外配置播放 Token。
+提供摄像头密码、网页登录密码，以及 WebDAV 模式下的账号密码和
+`CAMVAULT_ARCHIVE_KEY`；外部播放器/API 如需使用再额外配置播放 Token。
 
 本地后端必须给服务账号目标录像目录写权限。WebDAV 后端不需要本地录像目录，但服务日志、
 AList 日志、AList SQLite 和容器日志仍应按“是否允许写 SSD”的目标单独配置。
@@ -647,6 +669,10 @@ uv run camvault self-test
 uv run pytest -q
 uv build --offline
 ```
+
+0.8.0 当前回归结果为 67 项测试全部通过；正式 N5105 部署还验证了两路加密上传、密文
+Range 回放、4K HEVC + AAC 时间段导出和开机自动恢复。详细数据见
+[`TEST_REPORT.md`](TEST_REPORT.md)。
 
 自动化测试还覆盖：
 
