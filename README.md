@@ -2,9 +2,9 @@
 
 CamVault 是一个面向家庭多摄像头、7×24 运行的 ONVIF/RTSP 录像工具。
 
-当前主线版本为 **0.8.0**：WebDAV 录像与元数据在上传前使用分块 AES-256-GCM
-加密，历史回放和按时间导出仍由 CamVault 透明完成。既有明文录像保持可读，新产生的
-WebDAV 归档默认建议启用加密。
+当前主线版本为 **0.9.0**：WebDAV 录像与元数据在上传前使用分块 AES-256-GCM
+加密，并能依据每路实时码率和系统可用内存自动调整归档时长及目标大小。历史回放和
+按时间导出仍由 CamVault 透明完成，既有明文录像保持可读。
 
 - Python 3.11+，使用 `uv` 管理项目；Windows、macOS、Linux 共用一套代码。
 - 带用户名/密码的 ONVIF Media1/Media2 自动取流，也支持直接填写 RTSP URL。
@@ -259,8 +259,14 @@ export CAMVAULT_ARCHIVE_KEY="$(openssl rand -base64 32)"
 [storage]
 backend = "webdav"
 timezone = "Asia/Shanghai"
-archive_chunk_seconds = 60
-max_buffer_mb_per_camera = 256
+archive_chunk_seconds = 600
+adaptive_archive_enabled = true
+adaptive_archive_min_seconds = 120
+adaptive_archive_max_seconds = 1800
+adaptive_archive_target_mb = 32
+adaptive_memory_percent = 5
+adaptive_memory_reserve_mb = 512
+max_buffer_mb_per_camera = 128
 retention_days = 30
 max_storage_gb = 0
 # AList/网盘不暴露 DAV quota 时必须设 0。
@@ -335,8 +341,14 @@ deploy/alist-no-ssd/compose.override.example.yml
 
 ```toml
 [storage]
-archive_chunk_seconds = 60
-max_buffer_mb_per_camera = 256
+archive_chunk_seconds = 600 # 关闭自适应时的固定值，也是启动初值
+adaptive_archive_enabled = true
+adaptive_archive_min_seconds = 120
+adaptive_archive_max_seconds = 1800
+adaptive_archive_target_mb = 32
+adaptive_memory_percent = 5
+adaptive_memory_reserve_mb = 512
+max_buffer_mb_per_camera = 128 # 始终生效的每路绝对硬上限
 
 [recording]
 hls_segment_seconds = 2
@@ -349,7 +361,13 @@ max_ingest_segment_mb = 64
 |---|---|
 | `hls_segment_seconds` | FFmpeg 小分片目标时长，影响直播延迟 |
 | `live_window_segments` | 浏览器可见直播窗口 |
-| `archive_chunk_seconds` | 大归档目标时长，越大则网盘对象/API 越少 |
+| `archive_chunk_seconds` | 固定模式的批次时长；自适应模式开始采到码率前的启动初值 |
+| `adaptive_archive_enabled` | WebDAV 根据每路平滑码率和可用内存持续自动计算目标时长/大小 |
+| `adaptive_archive_min_seconds` | 自动时间目标下限；高码率先达到字节目标时仍可更早上传 |
+| `adaptive_archive_max_seconds` | 低码率时允许的最长自动时间目标 |
+| `adaptive_archive_target_mb` | 内存充足时每路期望的最大归档大小 |
+| `adaptive_memory_percent` | 扣除预留内存后，全部摄像头归档目标最多使用的可用内存比例 |
+| `adaptive_memory_reserve_mb` | 永不纳入自动归档目标计算的物理内存预留 |
 | `max_buffer_mb_per_camera` | 每摄像头归档数据硬预算；满后反压，不无限增内存 |
 | `max_live_memory_mb_per_camera` | 直播窗口字节硬上限 |
 | `max_ingest_segment_mb` | 单个 HTTP 分片上限，必须不大于归档预算 |
@@ -367,8 +385,16 @@ max_ingest_segment_mb = 64
 | 600 秒 | 286 MiB | 144 | 576 |
 | 900 秒 | 429 MiB | 96 | 384 |
 
-默认 1 分钟偏向流畅历史定位。若网盘 API 次数或风控比定位速度更重要，可改为 5～10 分钟、
-每摄像头 256～512 MiB 的归档预算；仍需根据上行带宽、网盘单文件限制和内存总量实测。
+自适应模式用约 5 分钟指数平滑的每路码率估算 `n = 目标字节 ÷ 字节/秒`，再限制在配置的
+最短/最长区间。目标字节取以下三者中最小值：配置目标、每路硬上限的三分之一、扣除预留
+内存后可用 RAM 配额的每路份额，同时不低于当前完整分片或 1 MiB 安全下限。系统内存变少
+时会缩小批次并提前上传；低码率且内存充足时则延长批次。可用内存最多每 5 秒读取一次，
+不持续扫描进程或媒体，也不增加视频编解码。
+
+三分之一限制为“正在上传 + 一个排队批次 + 当前聚合批次”留出空间；无论自动结果如何，
+`max_buffer_mb_per_camera` 都是绝对硬上限，达到后继续使用已有反压。页面会显示每路当前
+自动目标。若更重视最新历史的可见速度或异常断电时的录像损失窗口，应调低
+`adaptive_archive_max_seconds`。
 
 媒体 RAM 的稳态预算约为：
 
@@ -376,6 +402,8 @@ max_ingest_segment_mb = 64
 摄像头数 × (max_buffer_mb_per_camera + max_live_memory_mb_per_camera)
 ```
 
+这是绝对上界估算。自适应模式下单批的常规目标还会受
+`adaptive_archive_target_mb`、可用内存比例和每路硬上限三分之一约束，通常明显更低。
 接收一个新 HTTP 分片时还有瞬时内存。Python 不写本地文件不代表 OS 一定不换页；对
 “物理上绝不写 SSD”有硬要求时还需评估 swap。
 
@@ -530,7 +558,7 @@ WebDAV 模式下，浏览器不会获得 AList 凭据。CamVault 在服务端代
 声音索引复用本来就用于 AAC 输出的音频解码，实时聚合为每个 HLS 分片一个 RMS 峰值，
 不会二次读取或解码录像。完整 dB 索引跟随媒体写入本地/WebDAV JSON 侧车；归档文件名另带
 最多 128 个时间桶的紧凑活动位图，因此远端时间轴只使用原有 PROPFIND 列表，不会为了画
-声音标记逐个下载每分钟侧车。默认阈值可按环境噪音调整：
+声音标记逐个下载每个归档侧车。默认阈值可按环境噪音调整：
 
 ```toml
 [recording]
@@ -670,7 +698,7 @@ uv run pytest -q
 uv build --offline
 ```
 
-0.8.0 当前回归结果为 67 项测试全部通过；正式 N5105 部署还验证了两路加密上传、密文
+0.9.0 当前回归结果见测试报告；正式 N5105 部署还验证了两路加密上传、密文
 Range 回放、4K HEVC + AAC 时间段导出和开机自动恢复。详细数据见
 [`TEST_REPORT.md`](TEST_REPORT.md)。
 

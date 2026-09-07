@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from camvault.archive import (
+    ArchiveAccumulator,
     ArchiveBatch,
     ArchiveManager,
     ArchiveRecord,
@@ -39,6 +40,104 @@ def _segment(
         audio_rms_db=audio_rms_db,
         audio_active=audio_active,
     )
+
+
+def test_long_archive_interval_reduces_small_uploads_but_keeps_byte_cap() -> None:
+    start = datetime(2026, 9, 7, tzinfo=UTC)
+    timed = ArchiveAccumulator(camera_id="front", target_seconds=600, max_bytes=1024)
+    assert timed.add(_segment(0, b"a", start, duration=300)) is None
+    timed_batch = timed.add(_segment(1, b"b", start + timedelta(seconds=300), duration=300))
+    assert timed_batch is not None
+    assert timed_batch.duration == 600
+    assert timed_batch.size_bytes == 2
+
+    capped = ArchiveAccumulator(camera_id="front", target_seconds=600, max_bytes=4)
+    assert capped.add(_segment(0, b"abc", start, duration=2)) is None
+    capped_batch = capped.add(_segment(1, b"d", start + timedelta(seconds=2), duration=2))
+    assert capped_batch is not None
+    assert capped_batch.duration == 4
+    assert capped_batch.size_bytes == 4
+
+
+@pytest.mark.asyncio
+async def test_adaptive_archive_uses_bitrate_and_available_memory(tmp_path: Path) -> None:
+    mib = 1024 * 1024
+    memory = [1024 * mib]
+    written: list[ArchiveBatch] = []
+
+    async def writer(batch: ArchiveBatch) -> ArchiveRecord:
+        written.append(batch)
+        return ArchiveRecord(
+            camera_id=batch.camera_id,
+            path=None,
+            relative_path=f"{len(written)}.ts",
+            start=batch.start,
+            end=batch.end,
+            duration=batch.duration,
+            size_bytes=batch.size_bytes,
+        )
+
+    storage = StorageConfig(
+        backend="webdav",
+        archive_chunk_seconds=600,
+        max_buffer_mb_per_camera=64,
+        adaptive_archive_enabled=True,
+        adaptive_archive_min_seconds=120,
+        adaptive_archive_max_seconds=1800,
+        adaptive_archive_target_mb=32,
+        adaptive_memory_percent=5,
+        adaptive_memory_reserve_mb=512,
+        min_free_gb=0,
+    )
+    manager = ArchiveManager(
+        camera_ids=["front", "door"],
+        storage=storage,
+        writer=writer,
+        available_memory_provider=lambda: memory[0],
+    )
+    await manager.start()
+    start = datetime(2026, 9, 7, tzinfo=UTC)
+    try:
+        await manager.add("front", _segment(0, b"a" * mib, start, duration=60))
+        first = manager.batching_status()
+        first_camera = first["cameras"]["front"]
+        assert first["available_memory_bytes"] == 1024 * mib
+        assert first_camera["target_bytes"] == int(512 * mib * 0.05) // 2
+        assert 700 < first_camera["target_seconds"] < 800
+        assert written == []
+
+        await manager.add("door", _segment(0, b"c" * mib, start, duration=2))
+        high_bitrate = manager.batching_status()["cameras"]["door"]
+        assert high_bitrate["target_seconds"] == 120
+        assert high_bitrate["target_seconds"] < first_camera["target_seconds"]
+
+        for sequence in range(1, 13):
+            await manager.add(
+                "door",
+                _segment(
+                    sequence,
+                    b"d" * mib,
+                    start + timedelta(seconds=sequence * 2),
+                    duration=2,
+                ),
+            )
+        await manager.queues["door"].join()
+        assert written[0].camera_id == "door"
+        assert written[0].duration == 26
+        assert written[0].duration < high_bitrate["target_seconds"]
+
+        memory[0] = 512 * mib
+        manager._memory_sampled_at = 0  # force the next inexpensive five-second sample
+        await manager.add(
+            "front", _segment(1, b"b" * (mib // 2), start + timedelta(seconds=60), duration=60)
+        )
+        await manager.queues["front"].join()
+        constrained = manager.batching_status()["cameras"]["front"]
+        assert constrained["target_bytes"] == mib
+        assert constrained["target_seconds"] == 120
+        assert len(written) == 2
+    finally:
+        await manager.stop()
 
 
 def test_archive_is_atomic_hashed_and_partitioned_by_local_hour(tmp_path: Path) -> None:

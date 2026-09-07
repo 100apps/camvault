@@ -5,7 +5,7 @@ Install the built wheel and its dependencies into a persistent virtual environme
 
 ```sh
 uv venv /data/camvault/venv
-uv pip install --python /data/camvault/venv/bin/python camvault-0.8.0-py3-none-any.whl
+uv pip install --python /data/camvault/venv/bin/python camvault-0.9.0-py3-none-any.whl
 
 cp config.toml /data/camvault/config.toml
 cp deploy/openwrt/run-camvault.sh.example /data/camvault/run.sh

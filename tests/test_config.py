@@ -153,3 +153,14 @@ def test_webdav_archive_encryption_requires_a_32_byte_environment_key(
 def test_webdav_encryption_chunk_size_must_be_power_of_two() -> None:
     with pytest.raises(ValidationError, match="power of two"):
         WebDAVConfig(encryption_chunk_kb=1000)
+
+
+def test_adaptive_archive_bounds_are_consistent() -> None:
+    with pytest.raises(ValidationError, match="adaptive_archive_min_seconds"):
+        StorageConfig(adaptive_archive_min_seconds=900, adaptive_archive_max_seconds=300)
+    with pytest.raises(ValidationError, match="adaptive_archive_target_mb"):
+        StorageConfig(
+            max_buffer_mb_per_camera=64,
+            adaptive_archive_enabled=True,
+            adaptive_archive_target_mb=65,
+        )

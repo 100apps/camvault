@@ -8,6 +8,7 @@ import math
 import os
 import re
 import secrets
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -18,6 +19,55 @@ from camvault.buffer import LiveSegment
 from camvault.config import StorageConfig
 
 logger = logging.getLogger(__name__)
+
+_MIB = 1024 * 1024
+
+
+def available_memory_bytes() -> int | None:
+    """Return an inexpensive cross-platform estimate of available physical memory."""
+
+    meminfo = Path("/proc/meminfo")
+    try:
+        if meminfo.is_file():
+            for line in meminfo.read_text(encoding="ascii").splitlines():
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("length", ctypes.c_ulong),
+                    ("memory_load", ctypes.c_ulong),
+                    ("total_physical", ctypes.c_ulonglong),
+                    ("available_physical", ctypes.c_ulonglong),
+                    ("total_page_file", ctypes.c_ulonglong),
+                    ("available_page_file", ctypes.c_ulonglong),
+                    ("total_virtual", ctypes.c_ulonglong),
+                    ("available_virtual", ctypes.c_ulonglong),
+                    ("available_extended_virtual", ctypes.c_ulonglong),
+                ]
+
+            status = _MemoryStatusEx()
+            status.length = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.available_physical)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    try:
+        pages = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return int(pages * page_size)
+    except (AttributeError, OSError, ValueError):
+        pass
+    return None
+
 
 _ARCHIVE_FILENAME_RE = re.compile(
     r"^(?P<stamp>\d{8}T\d{6}[+-]\d{4})_"
@@ -260,6 +310,17 @@ class ArchiveAccumulator:
     def size_bytes(self) -> int:
         return self._bytes
 
+    def tune(self, *, target_seconds: float, max_bytes: int) -> ArchiveBatch | None:
+        """Apply live batching targets and seal data that already crossed a new target."""
+
+        self.target_seconds = max(0.001, target_seconds)
+        self.max_bytes = max(1, max_bytes)
+        if self._segments and (
+            self._duration >= self.target_seconds or self._bytes >= self.max_bytes
+        ):
+            return self.pop()
+        return None
+
     def add(self, segment: LiveSegment) -> ArchiveBatch | None:
         self._segments.append(segment)
         self._duration += segment.duration
@@ -280,6 +341,7 @@ class ArchiveAccumulator:
 
 ArchiveWriter = Callable[[ArchiveBatch], Awaitable[ArchiveRecord]]
 ArchiveReclaimer = Callable[[str, int], Awaitable[object]]
+AvailableMemoryProvider = Callable[[], int | None]
 
 
 class ArchiveManager:
@@ -299,15 +361,35 @@ class ArchiveManager:
         on_written: Callable[[ArchiveRecord], None] | None = None,
         on_error: Callable[[str, str], None] | None = None,
         on_reclaim: ArchiveReclaimer | None = None,
+        available_memory_provider: AvailableMemoryProvider = available_memory_bytes,
     ) -> None:
         self.storage = storage
         self.writer = writer
-        self.max_bytes_per_camera = storage.max_buffer_mb_per_camera * 1024 * 1024
+        self.max_bytes_per_camera = storage.max_buffer_mb_per_camera * _MIB
+        self.adaptive_enabled = storage.backend == "webdav" and storage.adaptive_archive_enabled
+        self._camera_count = max(1, len(camera_ids))
+        self._available_memory_provider = available_memory_provider
+        self._available_memory_bytes: int | None = None
+        self._memory_sampled_at = 0.0
+        self._estimated_bytes_per_second = {camera_id: 0.0 for camera_id in camera_ids}
+        initial_target_bytes = (
+            min(
+                storage.adaptive_archive_target_mb * _MIB,
+                max(1, self.max_bytes_per_camera // 3),
+            )
+            if self.adaptive_enabled
+            else self.max_bytes_per_camera
+        )
+        initial_target_seconds = storage.archive_chunk_seconds
+        self._target_bytes = {camera_id: initial_target_bytes for camera_id in camera_ids}
+        self._target_seconds = {camera_id: initial_target_seconds for camera_id in camera_ids}
         self.accumulators = {
             camera_id: ArchiveAccumulator(
                 camera_id=camera_id,
-                target_seconds=storage.archive_chunk_seconds,
-                max_bytes=self.max_bytes_per_camera,
+                target_seconds=initial_target_seconds,
+                max_bytes=(
+                    initial_target_bytes if self.adaptive_enabled else self.max_bytes_per_camera
+                ),
             )
             for camera_id in camera_ids
         }
@@ -328,6 +410,27 @@ class ArchiveManager:
         if camera_id is not None:
             return self._retained_bytes[camera_id]
         return sum(self._retained_bytes.values())
+
+    def batching_status(self) -> dict[str, object]:
+        return {
+            "adaptive": self.adaptive_enabled,
+            "available_memory_bytes": self._available_memory_bytes,
+            "hard_max_bytes_per_camera": self.max_bytes_per_camera,
+            "memory_percent": self.storage.adaptive_memory_percent,
+            "memory_reserve_bytes": self.storage.adaptive_memory_reserve_mb * _MIB,
+            "cameras": {
+                camera_id: {
+                    "estimated_bytes_per_second": round(
+                        self._estimated_bytes_per_second[camera_id], 1
+                    ),
+                    "target_seconds": round(self._target_seconds[camera_id], 1),
+                    "target_bytes": self._target_bytes[camera_id],
+                    "buffer_seconds": round(accumulator.duration, 1),
+                    "buffer_bytes": accumulator.size_bytes,
+                }
+                for camera_id, accumulator in self.accumulators.items()
+            },
+        }
 
     async def start(self) -> None:
         self._closing = False
@@ -352,6 +455,10 @@ class ArchiveManager:
         # disconnected/restarted FFmpeg requests from piling payloads into the archive path.
         async with self._ingest_locks[camera_id]:
             accumulator = self.accumulators[camera_id]
+            if self.adaptive_enabled:
+                batch = self._tune_accumulator(camera_id, accumulator, segment)
+                if batch is not None:
+                    await self.queues[camera_id].put(batch)
             if (
                 accumulator.size_bytes
                 and accumulator.size_bytes + segment_bytes > self.max_bytes_per_camera
@@ -364,6 +471,56 @@ class ArchiveManager:
             batch = accumulator.add(segment)
             if batch is not None:
                 await self.queues[camera_id].put(batch)
+
+    def _tune_accumulator(
+        self,
+        camera_id: str,
+        accumulator: ArchiveAccumulator,
+        segment: LiveSegment,
+    ) -> ArchiveBatch | None:
+        duration = max(0.001, segment.duration)
+        instant_rate = len(segment.data) / duration
+        previous_rate = self._estimated_bytes_per_second[camera_id]
+        # Five-minute exponential smoothing avoids oscillating object sizes with every
+        # keyframe-heavy segment while still following a sustained bitrate change.
+        alpha = min(1.0, max(0.01, duration / 300.0))
+        estimated_rate = (
+            instant_rate
+            if previous_rate <= 0
+            else previous_rate + alpha * (instant_rate - previous_rate)
+        )
+        self._estimated_bytes_per_second[camera_id] = estimated_rate
+
+        now = time.monotonic()
+        if now - self._memory_sampled_at >= 5.0:
+            try:
+                self._available_memory_bytes = self._available_memory_provider()
+            except (OSError, ValueError):
+                self._available_memory_bytes = None
+            self._memory_sampled_at = now
+
+        candidates = [
+            self.storage.adaptive_archive_target_mb * _MIB,
+            max(1, self.max_bytes_per_camera // 3),
+        ]
+        if self._available_memory_bytes is not None:
+            reserve = self.storage.adaptive_memory_reserve_mb * _MIB
+            free_after_reserve = max(0, self._available_memory_bytes - reserve)
+            adaptive_pool = int(free_after_reserve * self.storage.adaptive_memory_percent / 100)
+            candidates.append(adaptive_pool // self._camera_count)
+        # A small floor prevents a brief low-memory sample from degenerating into one
+        # remote object per two-second HLS segment. A segment larger than the floor always
+        # remains indivisible and therefore becomes the target itself.
+        target_bytes = max(len(segment.data), min(_MIB, self.max_bytes_per_camera), min(candidates))
+        target_bytes = min(self.max_bytes_per_camera, max(1, target_bytes))
+        target_seconds = target_bytes / max(1.0, estimated_rate)
+        target_seconds = min(
+            self.storage.adaptive_archive_max_seconds,
+            max(self.storage.adaptive_archive_min_seconds, target_seconds),
+        )
+        self._target_bytes[camera_id] = target_bytes
+        self._target_seconds[camera_id] = target_seconds
+        return accumulator.tune(target_seconds=target_seconds, max_bytes=target_bytes)
 
     async def rotate_camera(self, camera_id: str) -> None:
         """Seal the current tail without waiting for backend I/O to finish."""

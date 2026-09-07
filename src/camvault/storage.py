@@ -161,6 +161,7 @@ class StorageBackend:
     kind: str
     location: str
     diskless_media_path: bool
+    storage: StorageConfig
 
     async def start(self) -> None:
         raise NotImplementedError
@@ -353,7 +354,7 @@ class WebDAVStorageBackend(StorageBackend):
             ),
             verify=self.config.verify_tls,
             follow_redirects=True,
-            headers={"User-Agent": "CamVault/0.8.0", "Accept-Encoding": "identity"},
+            headers={"User-Agent": "CamVault/0.9.0", "Accept-Encoding": "identity"},
         )
 
     @property

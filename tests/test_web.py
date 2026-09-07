@@ -166,6 +166,9 @@ async def test_ingest_auth_live_and_vod_playback(
             assert payload["bounded_media_memory_bytes"] >= 6
             assert payload["write_bytes_last_minute"] == 6
             assert payload["storage"]["capacity"]["total_bytes"] > 0
+            assert payload["archive_batching"]["adaptive"] is False
+            assert payload["archive_batching"]["hard_max_bytes_per_camera"] == 8 * 1024 * 1024
+            assert payload["archive_batching"]["cameras"]["front"]["target_seconds"] == 4
 
             records = await service.archive_records("front")
             timeline = await client.get(
@@ -277,7 +280,7 @@ rtsp_url = "rtsp://127.0.0.1/unused"
         assert "实时监控" in dashboard.text
         assert "历史回放" in dashboard.text
         assert "hls.js@1.7.2" in dashboard.text
-        assert "/assets/dashboard.js?v=9" in dashboard.text
+        assert "/assets/dashboard.js?v=11" in dashboard.text
         assert 'id="playbackRate"' in dashboard.text
         assert 'id="nextSound"' in dashboard.text
         assert 'id="downloadCamera"' in dashboard.text

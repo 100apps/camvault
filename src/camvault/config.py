@@ -171,10 +171,17 @@ class StorageConfig(BaseModel):
     root: Path = Path("./recordings")
     webdav: WebDAVConfig = Field(default_factory=WebDAVConfig)
     timezone: str = "Asia/Shanghai"
-    # Archive objects are intentionally larger than live HLS segments. One minute keeps
-    # remote-object counts reasonable while still giving history playback a quick seek.
+    # Fixed batching remains the compatibility default. The generated WebDAV-first config
+    # enables adaptive batching, which tunes duration and target bytes from recent bitrate
+    # and available physical memory while preserving this value as its fallback.
     archive_chunk_seconds: float = Field(default=60.0, ge=4.0, le=3600.0)
     max_buffer_mb_per_camera: int = Field(default=128, ge=8, le=4096)
+    adaptive_archive_enabled: bool = False
+    adaptive_archive_min_seconds: float = Field(default=120.0, ge=4.0, le=3600.0)
+    adaptive_archive_max_seconds: float = Field(default=1800.0, ge=4.0, le=21600.0)
+    adaptive_archive_target_mb: int = Field(default=32, ge=1, le=2048)
+    adaptive_memory_percent: float = Field(default=5.0, ge=0.1, le=50.0)
+    adaptive_memory_reserve_mb: int = Field(default=512, ge=0, le=1_048_576)
     retention_days: int = Field(default=30, ge=0, le=36500)
     max_storage_gb: float = Field(default=0.0, ge=0.0)
     min_free_gb: float = Field(default=10.0, ge=0.0)
@@ -193,6 +200,22 @@ class StorageConfig(BaseModel):
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise ValueError(f"unknown IANA timezone: {value}") from exc
         return value
+
+    @model_validator(mode="after")
+    def validate_adaptive_archive(self) -> StorageConfig:
+        if self.adaptive_archive_min_seconds > self.adaptive_archive_max_seconds:
+            raise ValueError(
+                "storage.adaptive_archive_min_seconds must be <= "
+                "storage.adaptive_archive_max_seconds"
+            )
+        if (
+            self.adaptive_archive_enabled
+            and self.adaptive_archive_target_mb > self.max_buffer_mb_per_camera
+        ):
+            raise ValueError(
+                "storage.adaptive_archive_target_mb must be <= storage.max_buffer_mb_per_camera"
+            )
+        return self
 
 
 class RecordingConfig(BaseModel):

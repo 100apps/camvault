@@ -245,7 +245,7 @@ def create_app(
 
     app = FastAPI(
         title="CamVault",
-        version="0.8.0",
+        version="0.9.0",
         description="RAM-buffered ONVIF/RTSP recorder with local and WebDAV archives",
         lifespan=lifespan,
         docs_url="/api/docs",
@@ -713,7 +713,7 @@ def create_app(
             "#EXT-X-MEDIA-SEQUENCE:0",
         ]
         # The first returned archive may start before the requested instant because
-        # archives are intentionally minute-sized. EXT-X-START makes the player seek to
+        # archives are intentionally larger than live segments. EXT-X-START makes the player seek to
         # the requested wall-clock point without exposing that storage detail in the UI.
         start_offset = (start_dt - records[0].start).total_seconds()
         if start_offset > 0:
@@ -903,9 +903,9 @@ def create_app(
         )
         page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark">
-<title>CamVault · 监控中心</title><link rel="stylesheet" href="/assets/dashboard.css?v=9">
+<title>CamVault · 监控中心</title><link rel="stylesheet" href="/assets/dashboard.css?v=11">
 <script defer src="https://cdn.jsdelivr.net/npm/hls.js@1.7.2/dist/hls.min.js"></script>
-<script>window.CAMVAULT_BOOTSTRAP={bootstrap};</script><script defer src="/assets/dashboard.js?v=9"></script></head>
+<script>window.CAMVAULT_BOOTSTRAP={bootstrap};</script><script defer src="/assets/dashboard.js?v=11"></script></head>
 <body><header class="app-header"><a class="brand" href="/"><span class="brand-mark"><i></i></span><span><b>CamVault</b><small>视频归档系统</small></span></a>
 <nav><button class="nav-item active" data-view="monitor">监控中心</button><button class="nav-item" data-view="system">系统管理</button></nav>
 <div class="header-actions"><span class="health-chip" id="overall"><i></i>正在连接</span><button class="icon-button" id="logout" title="退出登录" hidden>退出</button></div></header>

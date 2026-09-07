@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.0 — 2026-09-07
+
+- Added adaptive WebDAV batching driven by a smoothed bitrate estimate and available
+  physical memory. Low-bitrate streams wait longer; high-bitrate or memory-constrained
+  streams commit sooner.
+- Added configurable duration bounds, target object size, available-memory percentage and
+  reserved-memory floor while retaining the per-camera buffer as an absolute hard limit.
+- Exposed each camera's live target duration, target bytes, bitrate estimate and buffer in
+  status; the dashboard summarizes the active automatic range.
+
 ## 0.8.0 — 2026-09-04
 
 - Added upload-before-cloud, chunked AES-256-GCM encryption for WebDAV video and metadata.

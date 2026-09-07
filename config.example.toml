@@ -30,7 +30,17 @@ backend = "webdav"
 root = "./recordings"
 
 timezone = "Asia/Shanghai"
-archive_chunk_seconds = 60
+# Used as the fixed interval or as the fallback if available memory cannot be measured.
+archive_chunk_seconds = 600
+# Dynamic WebDAV batching: estimate each camera bitrate and continuously choose n seconds.
+adaptive_archive_enabled = true
+adaptive_archive_min_seconds = 120
+adaptive_archive_max_seconds = 1800
+adaptive_archive_target_mb = 32
+# Use at most this share of currently available RAM after keeping the reserve untouched.
+adaptive_memory_percent = 5
+adaptive_memory_reserve_mb = 512
+# Absolute hard ceiling across the active upload, queue and accumulator for each camera.
 max_buffer_mb_per_camera = 128
 retention_days = 30
 max_storage_gb = 0

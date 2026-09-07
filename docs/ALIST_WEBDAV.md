@@ -145,8 +145,14 @@ $env:CAMVAULT_WEBDAV_PASSWORD = '替换成强密码'
 [storage]
 backend = "webdav"
 timezone = "Asia/Shanghai"
-archive_chunk_seconds = 60
-max_buffer_mb_per_camera = 256
+archive_chunk_seconds = 600
+adaptive_archive_enabled = true
+adaptive_archive_min_seconds = 120
+adaptive_archive_max_seconds = 1800
+adaptive_archive_target_mb = 32
+adaptive_memory_percent = 5
+adaptive_memory_reserve_mb = 512
+max_buffer_mb_per_camera = 128
 retention_days = 30
 max_storage_gb = 0
 # AList/网盘若不提供 DAV quota，设为 0。
@@ -346,8 +352,11 @@ API 调用。实际批次结束条件为：
 
 推荐：
 
-- 交互式历史回放优先：`archive_chunk_seconds = 60`，首帧和时间定位更快；
-- 网盘 API 次数/风控优先：可提高到 `archive_chunk_seconds = 300~600`；
+- 推荐启用 `adaptive_archive_enabled`，由平滑后的每路码率和 `MemAvailable` 自动计算批次；
+- 交互式历史回放优先：降低 `adaptive_archive_max_seconds`，最新归档更快可见；
+- 网盘 API 次数/风控优先：提高 `adaptive_archive_max_seconds`，但要接受更长的 RAM 风险窗口；
+- 目标字节还受可用内存配额和每路硬上限三分之一约束，内存吃紧时会提前上传；
+- 每路达到 `max_buffer_mb_per_camera` 时继续反压，不会为了等待时间目标而无限占用 RAM；
 - 4 Mbit/s、5 分钟：`max_buffer_mb_per_camera >= 192`，建议 256；
 - 4 Mbit/s、10 分钟：建议 384 或 512；
 - `max_connections` 至少覆盖并发上传摄像头数，再留 2~4 个连接给播放和 PROPFIND；
@@ -357,6 +366,9 @@ API 调用。实际批次结束条件为：
 
 ```text
 批次 MiB ≈ 码率(Mbit/s) × 秒数 ÷ 8 ÷ 1.048576
+自动目标字节 = max(当前分片, 1 MiB 安全下限,
+                     min(配置目标, 每路硬上限 / 3, (MemAvailable - 预留) × 比例 / 摄像头数))
+自动 n 秒 = clamp(自动目标字节 / 每路平滑字节率, 最短秒数, 最长秒数)
 ```
 
 CamVault 每台摄像头的长期媒体 RAM 预算约为：

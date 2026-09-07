@@ -240,16 +240,31 @@
       const capacity = data.storage.capacity || {};
       const managed = capacity.managed_archive_bytes;
       const protection = data.storage.encryption?.enabled ? " · AES-256-GCM 已加密" : "";
+      const batching = data.archive_batching || {};
+      const tunings = Object.values(batching.cameras || {});
+      const targetSeconds = tunings.map((item) => Number(item.target_seconds || 0)).filter(Boolean);
+      const targetBytes = tunings.map((item) => Number(item.target_bytes || 0)).filter(Boolean);
+      const secondsMin = targetSeconds.length ? Math.min(...targetSeconds) : 0;
+      const secondsMax = targetSeconds.length ? Math.max(...targetSeconds) : 0;
+      const formatInterval = (seconds) => seconds >= 60
+        ? `${(seconds / 60).toFixed(seconds % 60 ? 1 : 0)} 分钟`
+        : `${Math.round(seconds)} 秒`;
+      const interval = secondsMin === secondsMax
+        ? formatInterval(secondsMin)
+        : `${formatInterval(secondsMin)}–${formatInterval(secondsMax)}`;
+      const batchPolicy = targetSeconds.length
+        ? ` · ${batching.adaptive ? "自动" : "固定"} ${interval}/批，目标≤${humanBytes(Math.max(...targetBytes))}`
+        : "";
       if (capacity.total_bytes !== null && capacity.total_bytes !== undefined) {
         const percent = capacity.total_bytes > 0
           ? Math.min(100, capacity.used_bytes / capacity.total_bytes * 100)
           : 0;
         $("storageUsage").textContent = `${percent.toFixed(1)}%`;
-        $("storageDetail").textContent = `${humanBytes(capacity.used_bytes)} 已用 · ${humanBytes(capacity.free_bytes)} 可用 · ${data.storage.backend.toUpperCase()}${protection}`;
+        $("storageDetail").textContent = `${humanBytes(capacity.used_bytes)} 已用 · ${humanBytes(capacity.free_bytes)} 可用 · ${data.storage.backend.toUpperCase()}${protection}${batchPolicy}`;
         $("storageMeter").style.width = `${percent}%`;
       } else {
         $("storageUsage").textContent = humanBytes(managed);
-        $("storageDetail").textContent = `CamVault 归档 · ${data.storage.backend.toUpperCase()} 未提供总配额${protection}`;
+        $("storageDetail").textContent = `CamVault 归档 · ${data.storage.backend.toUpperCase()} 未提供总配额${protection}${batchPolicy}`;
         $("storageMeter").style.width = "0";
       }
 

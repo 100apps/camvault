@@ -397,6 +397,7 @@ class CamVaultService:
             "live_memory_bytes": live_bytes,
             "archive_buffer_bytes": archive_buffer_bytes,
             "bounded_media_memory_bytes": live_bytes + archive_buffer_bytes,
+            "archive_batching": self.archive_manager.batching_status(),
             "write_bytes_last_minute": write_bytes_last_minute,
             "write_mbps_last_minute": round(write_bytes_last_minute * 8 / 60 / 1_000_000, 3),
             "retention": {
