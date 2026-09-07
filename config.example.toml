@@ -8,6 +8,9 @@ web_password_env = "CAMVAULT_WEB_PASSWORD"
 session_hours = 24
 allow_unauthenticated_lan = false
 access_log = false
+# Graceful stop: stop cameras, then upload the remaining RAM video/audio index.
+# OpenWrt has a short system shutdown budget: use 10 with deploy/openwrt's init script.
+shutdown_timeout_seconds = 120
 
 [logging]
 # Recent diagnostics stay in RAM for the web console. File writes are batched.
@@ -30,7 +33,7 @@ backend = "webdav"
 root = "./recordings"
 
 timezone = "Asia/Shanghai"
-# Used as the fixed interval or as the fallback if available memory cannot be measured.
+# Fixed interval, or initial target before adaptive bitrate samples arrive.
 archive_chunk_seconds = 600
 # Dynamic WebDAV batching: estimate each camera bitrate and continuously choose n seconds.
 adaptive_archive_enabled = true

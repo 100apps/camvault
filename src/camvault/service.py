@@ -106,6 +106,9 @@ class CamVaultService:
         self._retention_wakeup = asyncio.Event()
         self._started = False
         self._supervisors_started = False
+        self._stopping = False
+        self._ingest_closed = False
+        self._stop_lock = asyncio.Lock()
         self.config_store = (
             ConfigStore(
                 config_path,
@@ -125,6 +128,8 @@ class CamVaultService:
 
     async def start(self, *, start_supervisors: bool = True) -> None:
         if not self._started:
+            self._stopping = False
+            self._ingest_closed = False
             backend_started = False
             manager_started = False
             try:
@@ -150,25 +155,64 @@ class CamVaultService:
 
     async def start_supervisors_after(self, delay_seconds: float = 0.25) -> None:
         await asyncio.sleep(delay_seconds)
-        if self._started and not self._supervisors_started:
+        if self._started and not self._stopping and not self._supervisors_started:
             self.supervisors.start()
             self._supervisors_started = True
 
     async def stop(self) -> None:
-        if not self._started:
-            return
-        if self._supervisors_started:
-            await self.supervisors.stop()
-            self._supervisors_started = False
-        if self._retention_task is not None:
-            self._retention_task.cancel()
-            await asyncio.gather(self._retention_task, return_exceptions=True)
-            self._retention_task = None
-        await self.archive_manager.stop()
-        await self.storage_backend.close()
-        self._started = False
+        async with self._stop_lock:
+            if not self._started:
+                return
+            self._stopping = True
+            started = time.monotonic()
+            timeout = self.config.server.shutdown_timeout_seconds
+            drain_complete = False
+            logger.info(
+                "shutdown drain started: %d archive bytes pending, deadline %.1fs",
+                self.archive_manager.memory_bytes(),
+                timeout,
+            )
+            try:
+                async with asyncio.timeout(timeout):
+                    if self._retention_task is not None:
+                        self._retention_task.cancel()
+                        await asyncio.gather(self._retention_task, return_exceptions=True)
+                        self._retention_task = None
+                    if self._supervisors_started:
+                        await self.supervisors.stop()
+                        self._supervisors_started = False
+                    # Finish already accepted HTTP uploads before sealing the final tail.
+                    for lock in self.upload_locks.values():
+                        async with lock:
+                            pass
+                    self._ingest_closed = True
+                    await self.archive_manager.stop()
+                    drain_complete = True
+            except TimeoutError:
+                logger.error("shutdown drain deadline exceeded after %.1fs", timeout)
+            finally:
+                self._ingest_closed = True
+                # Also clean up on cancellation or an unexpected producer failure.
+                await self.archive_manager.abort()
+                await self.supervisors.abort()
+                self._supervisors_started = False
+                try:
+                    await asyncio.wait_for(self.storage_backend.close(), timeout=5)
+                except TimeoutError:
+                    logger.error("storage connection cleanup timed out")
+                finally:
+                    self._started = False
+            if not drain_complete or self.archive_manager.unwritten_bytes:
+                logger.error(
+                    "shutdown incomplete: %d archive bytes could not be committed",
+                    self.archive_manager.unwritten_bytes,
+                )
+            else:
+                logger.info("shutdown drain complete in %.2fs", time.monotonic() - started)
 
     async def ingest_upload(self, camera_id: str, filename: str, payload: bytes) -> str:
+        if self._ingest_closed:
+            raise ValueError("recorder is stopping")
         camera = self.camera_map.get(camera_id)
         if camera is None:
             raise KeyError(camera_id)
@@ -388,7 +432,7 @@ class CamVaultService:
                 }
             )
         return {
-            "status": "ok",
+            "status": "stopping" if self._stopping else "ok",
             "storage": storage_status,
             # Kept for 0.1 clients. Remote mode intentionally has no local storage root.
             "storage_root": (

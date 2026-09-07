@@ -245,7 +245,7 @@ def create_app(
 
     app = FastAPI(
         title="CamVault",
-        version="0.9.0",
+        version="0.9.1",
         description="RAM-buffered ONVIF/RTSP recorder with local and WebDAV archives",
         lifespan=lifespan,
         docs_url="/api/docs",

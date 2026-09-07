@@ -354,7 +354,7 @@ class WebDAVStorageBackend(StorageBackend):
             ),
             verify=self.config.verify_tls,
             follow_redirects=True,
-            headers={"User-Agent": "CamVault/0.9.0", "Accept-Encoding": "identity"},
+            headers={"User-Agent": "CamVault/0.9.1", "Accept-Encoding": "identity"},
         )
 
     @property

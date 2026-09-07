@@ -29,6 +29,8 @@ class ServerConfig(BaseModel):
     session_hours: int = Field(default=24, ge=1, le=720)
     allow_unauthenticated_lan: bool = False
     access_log: bool = False
+    # Total budget for stopping recorders and committing pending archives on SIGTERM/INT.
+    shutdown_timeout_seconds: float = Field(default=120.0, ge=5.0, le=3600.0)
 
     def resolved_playback_token(self) -> str | None:
         if self.playback_token_env:

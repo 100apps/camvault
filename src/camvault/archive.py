@@ -402,6 +402,8 @@ class ArchiveManager:
         self.on_error = on_error
         self.on_reclaim = on_reclaim
         self._closing = False
+        self._shutdown_requested = asyncio.Event()
+        self.unwritten_bytes = 0
         self._retained_bytes = {camera_id: 0 for camera_id in camera_ids}
         self._budget_conditions = {camera_id: asyncio.Condition() for camera_id in camera_ids}
         self._ingest_locks = {camera_id: asyncio.Lock() for camera_id in camera_ids}
@@ -434,6 +436,8 @@ class ArchiveManager:
 
     async def start(self) -> None:
         self._closing = False
+        self._shutdown_requested.clear()
+        self.unwritten_bytes = 0
         for camera_id in self.accumulators:
             if camera_id not in self.workers:
                 self.workers[camera_id] = asyncio.create_task(
@@ -454,6 +458,8 @@ class ArchiveManager:
         # A per-camera lock covers all accumulator mutations. It also prevents multiple
         # disconnected/restarted FFmpeg requests from piling payloads into the archive path.
         async with self._ingest_locks[camera_id]:
+            if self._closing:
+                raise ValueError("archive manager is stopping")
             accumulator = self.accumulators[camera_id]
             if self.adaptive_enabled:
                 batch = self._tune_accumulator(camera_id, accumulator, segment)
@@ -541,18 +547,48 @@ class ArchiveManager:
         if not self.workers:
             return
         self._closing = True
-        await self.flush_all()
-        for queue in self.queues.values():
-            await queue.put(None)
+        self._shutdown_requested.set()
+        try:
+            await self.flush_all()
+            for queue in self.queues.values():
+                await queue.put(None)
+            await asyncio.gather(*self.workers.values(), return_exceptions=True)
+            self.workers.clear()
+        except BaseException:
+            await self.abort()
+            raise
+
+    async def abort(self) -> None:
+        """Release RAM after the service's shutdown deadline; report uncommitted bytes."""
+
+        self._closing = True
+        self._shutdown_requested.set()
+        pending = self.memory_bytes()
+        self.unwritten_bytes += pending
+        if pending:
+            logger.error("archive shutdown incomplete: %d uncommitted bytes in RAM", pending)
+        for worker in self.workers.values():
+            worker.cancel()
         await asyncio.gather(*self.workers.values(), return_exceptions=True)
         self.workers.clear()
+        for camera_id, queue in self.queues.items():
+            while not queue.empty():
+                queue.get_nowait()
+                queue.task_done()
+            self.accumulators[camera_id].pop()
+            await self._release(camera_id, self._retained_bytes[camera_id])
 
     async def _reserve(self, camera_id: str, size_bytes: int) -> None:
         condition = self._budget_conditions[camera_id]
         async with condition:
             await condition.wait_for(
-                lambda: self._retained_bytes[camera_id] + size_bytes <= self.max_bytes_per_camera
+                lambda: (
+                    self._closing
+                    or self._retained_bytes[camera_id] + size_bytes <= self.max_bytes_per_camera
+                )
             )
+            if self._closing:
+                raise ValueError("archive manager is stopping")
             self._retained_bytes[camera_id] += size_bytes
 
     async def _release(self, camera_id: str, size_bytes: int) -> None:
@@ -589,10 +625,9 @@ class ArchiveManager:
                         logger.error("camera %s: %s", camera_id, message)
                         if self.on_error:
                             self.on_error(camera_id, message)
-                        if self._closing:
-                            break
                         if (
-                            attempt == 1
+                            not self._closing
+                            and attempt == 1
                             and self.storage.write_failure_policy == "delete_oldest"
                             and self.on_reclaim is not None
                         ):
@@ -609,7 +644,18 @@ class ArchiveManager:
                                 # If the failure was not capacity-related, later attempts use
                                 # the normal bounded exponential backoff without more deletion.
                                 continue
-                        await asyncio.sleep(min(60.0, 2.0 ** min(attempt, 6)))
+                        if self._closing:
+                            # Retry shutdown failures until the service-wide deadline,
+                            # but don't hammer a failing cloud provider in a tight loop.
+                            await asyncio.sleep(2.0)
+                        else:
+                            try:
+                                await asyncio.wait_for(
+                                    self._shutdown_requested.wait(),
+                                    timeout=min(60.0, 2.0 ** min(attempt, 6)),
+                                )
+                            except TimeoutError:
+                                pass
             finally:
                 await self._release(camera_id, batch.size_bytes)
                 queue.task_done()

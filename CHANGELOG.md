@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.1 — 2026-09-07
+
+- On normal stop signals, stop recorders and drain archives before closing HTTP ingest,
+  allowing the final FFmpeg segment and encrypted audio-index sidecar to be committed.
+- Send FFmpeg a private stdin quit command and serialize termination so competing stop
+  paths cannot deliver duplicate signals that interrupt the final HTTP upload.
+- Add a configurable shutdown deadline, retry transient shutdown upload failures, and
+  explicitly report uncommitted RAM bytes on timeout.
+- Stop CamVault before AList on OpenWrt, wait for process exit, and respect rcS's short
+  shutdown-hook deadline. Extend systemd/launchd stop budgets for non-OpenWrt deployments.
+- Add real SIGTERM/SIGINT process tests with encrypted WebDAV uploads and failure injection.
+
 ## 0.9.0 — 2026-09-07
 
 - Added adaptive WebDAV batching driven by a smoothed bitrate estimate and available

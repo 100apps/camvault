@@ -9,6 +9,7 @@
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
+  <key>ExitTimeOut</key><integer>150</integer>
   <key>StandardOutPath</key><string>/Users/CHANGE_ME/Library/Logs/camvault.stdout.log</string>
   <key>StandardErrorPath</key><string>/Users/CHANGE_ME/Library/Logs/camvault.stderr.log</string>
 </dict></plist>

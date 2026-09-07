@@ -37,6 +37,7 @@ class CameraSupervisor:
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._process: asyncio.subprocess.Process | None = None
+        self._terminate_lock = asyncio.Lock()
 
     def start(self) -> None:
         if self._task is None:
@@ -49,6 +50,22 @@ class CameraSupervisor:
         if self._process is not None and self._process.returncode is None:
             await self._terminate(self._process)
         if self._task is not None:
+            # On timeout the service first aborts the archive queue, then aborts us.
+            # Don't cancel _run into a potentially blocked stream-tail callback here.
+            await asyncio.shield(asyncio.gather(self._task, return_exceptions=True))
+            self._task = None
+
+    async def abort(self) -> None:
+        """Stop producers promptly when graceful drain has exhausted its deadline."""
+
+        self._stop.set()
+        if self._process is not None and self._process.returncode is None:
+            try:
+                self._process.kill()
+            except ProcessLookupError:
+                pass
+        if self._task is not None:
+            self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
 
@@ -65,6 +82,8 @@ class CameraSupervisor:
             try:
                 self._set_state("resolving", "resolving ONVIF/RTSP stream")
                 rtsp_url, profile = await resolve_camera_rtsp(self.camera)
+                if self._stop.is_set():
+                    break
                 self.runtime.resolved_stream = redact_url(rtsp_url)
                 if profile and profile.width and profile.height:
                     self.runtime.resolved_profile = (
@@ -94,7 +113,9 @@ class CameraSupervisor:
                 self.runtime.started_at = datetime.now(UTC)
                 self._process = await asyncio.create_subprocess_exec(
                     *command,
-                    stdin=asyncio.subprocess.DEVNULL,
+                    # Private control pipe: q lets FFmpeg finish its HLS trailer/PUT
+                    # without setting the network-interrupt flag used by stop signals.
+                    stdin=asyncio.subprocess.PIPE,
                     stdout=(
                         asyncio.subprocess.PIPE
                         if self.on_audio_level is not None
@@ -262,14 +283,31 @@ class CameraSupervisor:
             self.on_audio_level(self.camera.id, max(-120.0, min(0.0, level)))
 
     async def _terminate(self, process: asyncio.subprocess.Process) -> None:
+        # Both stop() and the watchdog can arrive here. Sending duplicate TERM signals
+        # makes FFmpeg abort network I/O, including its final HLS segment.
+        async with self._terminate_lock:
+            await self._terminate_locked(process)
+
+    async def _terminate_locked(self, process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:
             return
+        if process.stdin is not None:
+            try:
+                process.stdin.write(b"q\n")
+                await process.stdin.drain()
+                await asyncio.wait_for(process.wait(), timeout=5)
+                logger.info("camera %s FFmpeg flushed and exited", self.camera.id)
+                return
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                logger.warning(
+                    "camera %s graceful FFmpeg exit timed out; sending TERM", self.camera.id
+                )
         try:
             process.terminate()
         except ProcessLookupError:
             return
         try:
-            await asyncio.wait_for(process.wait(), timeout=8)
+            await asyncio.wait_for(process.wait(), timeout=3)
         except TimeoutError:
             try:
                 process.kill()
@@ -313,5 +351,11 @@ class SupervisorManager:
     async def stop(self) -> None:
         await asyncio.gather(
             *(supervisor.stop() for supervisor in self.supervisors.values()),
+            return_exceptions=True,
+        )
+
+    async def abort(self) -> None:
+        await asyncio.gather(
+            *(supervisor.abort() for supervisor in self.supervisors.values()),
             return_exceptions=True,
         )

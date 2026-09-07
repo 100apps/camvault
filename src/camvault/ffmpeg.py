@@ -136,7 +136,7 @@ def build_camera_command(
     args = [
         recording.ffmpeg_path,
         "-hide_banner",
-        "-nostdin",
+        "-stdin",
         "-loglevel",
         recording.ffmpeg_loglevel,
         "-rtsp_transport",

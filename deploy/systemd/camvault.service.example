@@ -1,6 +1,7 @@
 [Unit]
 Description=CamVault ONVIF/RTSP recorder
 After=network-online.target
+# If AList is a local systemd service, add After=alist.service so it stops afterwards.
 Wants=network-online.target
 
 [Service]
@@ -13,7 +14,9 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/local/bin/uv run --project /opt/camvault --no-sync --no-dev camvault serve -c /etc/camvault/config.toml
 Restart=always
 RestartSec=5
-TimeoutStopSec=30
+TimeoutStopSec=150
+# Send TERM to the parent first; it stops FFmpeg after arranging the final upload.
+KillMode=mixed
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

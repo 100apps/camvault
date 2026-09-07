@@ -20,6 +20,7 @@ from camvault.logging_setup import config_secrets, configure_logging
 from camvault.onvif import OnvifError, resolve_camera_rtsp
 from camvault.security import redact_data, redact_text, redact_url
 from camvault.selftest import SelfTestError, run_self_test
+from camvault.server import CamVaultServer
 from camvault.service import CamVaultService
 from camvault.storage import StorageBackendError, create_storage_backend
 from camvault.web import create_app
@@ -476,14 +477,18 @@ def command_serve(args: argparse.Namespace) -> int:
         return 2
     app = create_app(service, manage_service=True, start_recorders=True)
     try:
-        uvicorn.run(
-            app,
-            host=config.server.host,
-            port=config.server.port,
-            log_level=args.log_level.lower(),
-            access_log=config.server.access_log,
-            log_config=None,
-        )
+        CamVaultServer(
+            uvicorn.Config(
+                app,
+                host=config.server.host,
+                port=config.server.port,
+                log_level=args.log_level.lower(),
+                access_log=config.server.access_log,
+                log_config=None,
+                timeout_graceful_shutdown=10,
+            ),
+            service,
+        ).run()
     finally:
         log_manager.close()
     return 0
