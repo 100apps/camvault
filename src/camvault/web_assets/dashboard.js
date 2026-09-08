@@ -241,6 +241,18 @@
       const managed = capacity.managed_archive_bytes;
       const protection = data.storage.encryption?.enabled ? " · AES-256-GCM 已加密" : "";
       const batching = data.archive_batching || {};
+      const spool = data.storage.spool;
+      const spoolInfo = spool
+        ? ` · 磁盘兜底 ${humanBytes(spool.pending_bytes)} 待传（${spool.pending_batches} 批），磁盘可用 ${humanBytes(spool.disk.free_bytes)}`
+        : "";
+      if (spool?.write_error || spool?.last_error || spool?.blocked_batches || spool?.orphan_bytes) {
+        $("overall").className = "health-chip bad";
+        $("overall").lastChild.textContent = spool.write_error
+          ? "磁盘暂存失败 · 请检查空间与权限"
+          : spool.blocked_batches || spool.orphan_bytes
+            ? "磁盘队列异常 · 请检查日志"
+            : "录像已暂存磁盘 · 待补传";
+      }
       const tunings = Object.values(batching.cameras || {});
       const targetSeconds = tunings.map((item) => Number(item.target_seconds || 0)).filter(Boolean);
       const targetBytes = tunings.map((item) => Number(item.target_bytes || 0)).filter(Boolean);
@@ -260,11 +272,11 @@
           ? Math.min(100, capacity.used_bytes / capacity.total_bytes * 100)
           : 0;
         $("storageUsage").textContent = `${percent.toFixed(1)}%`;
-        $("storageDetail").textContent = `${humanBytes(capacity.used_bytes)} 已用 · ${humanBytes(capacity.free_bytes)} 可用 · ${data.storage.backend.toUpperCase()}${protection}${batchPolicy}`;
+        $("storageDetail").textContent = `${humanBytes(capacity.used_bytes)} 已用 · ${humanBytes(capacity.free_bytes)} 可用 · ${data.storage.backend.toUpperCase()}${protection}${batchPolicy}${spoolInfo}`;
         $("storageMeter").style.width = `${percent}%`;
       } else {
         $("storageUsage").textContent = humanBytes(managed);
-        $("storageDetail").textContent = `CamVault 归档 · ${data.storage.backend.toUpperCase()} 未提供总配额${protection}${batchPolicy}`;
+        $("storageDetail").textContent = `CamVault 归档 · ${data.storage.backend.toUpperCase()} 未提供总配额${protection}${batchPolicy}${spoolInfo}`;
         $("storageMeter").style.width = "0";
       }
 

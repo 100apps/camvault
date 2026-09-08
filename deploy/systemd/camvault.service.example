@@ -11,6 +11,8 @@ Group=camvault
 WorkingDirectory=/opt/camvault
 EnvironmentFile=/etc/camvault/camvault.env
 Environment=PYTHONDONTWRITEBYTECODE=1
+StateDirectory=camvault
+Environment=CAMVAULT_SPOOL_DIRECTORY=/var/lib/camvault/spool
 ExecStart=/usr/local/bin/uv run --project /opt/camvault --no-sync --no-dev camvault serve -c /etc/camvault/config.toml
 Restart=always
 RestartSec=5
@@ -21,8 +23,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-# Local backend: change this to storage.root. The leading '-' permits WebDAV-only
-# deployments to start even when no local recording directory exists.
+# StateDirectory is persistent and writable under ProtectSystem=strict.
+# Local backend: also change the following path to storage.root.
 ReadWritePaths=-/srv/camvault-recordings
 
 [Install]

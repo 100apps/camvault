@@ -8,7 +8,7 @@ web_password_env = "CAMVAULT_WEB_PASSWORD"
 session_hours = 24
 allow_unauthenticated_lan = false
 access_log = false
-# Graceful stop: stop cameras, then upload the remaining RAM video/audio index.
+# Graceful stop: stop cameras, persist the RAM tail, then attempt remaining uploads.
 # OpenWrt has a short system shutdown budget: use 10 with deploy/openwrt's init script.
 shutdown_timeout_seconds = 120
 
@@ -25,8 +25,17 @@ backup_count = 5
 
 [storage]
 # "local": large sequential files on a local HDD/SSD/NAS mount.
-# "webdav": stream archive batches from RAM to AList/WebDAV; no local media spool.
+# "webdav": encrypt and persist batches locally, then stream them to AList/WebDAV.
 backend = "webdav"
+
+# WebDAV always has a durable outbox, including configs that omit these settings.
+# Default: "spool" beside the config, or CAMVAULT_SPOOL_DIRECTORY if set.
+# Use a persistent writable disk, never tmpfs/AList's disposable temp directory.
+# spool_directory = "./spool"
+spool_max_gb = 10
+spool_min_free_gb = 1
+spool_retry_seconds = 30
+spool_upload_timeout_seconds = 60
 
 # Used only by backend="local". Prefer a surveillance HDD/NAS mount.
 # A relative path is resolved beside this config file.
@@ -51,7 +60,7 @@ max_storage_gb = 0
 min_free_gb = 0
 retention_check_seconds = 3600
 partial_max_age_hours = 24
-# On the first archive write failure, delete the oldest managed recordings and retry
+# On local write failure or explicit WebDAV HTTP 507 quota failure, delete oldest and retry
 # the identical archive transaction. Use "retry" to never delete because of a write error.
 write_failure_policy = "delete_oldest"
 write_failure_reclaim_mb = 512

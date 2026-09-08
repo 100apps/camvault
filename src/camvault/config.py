@@ -172,6 +172,12 @@ class StorageConfig(BaseModel):
     backend: Literal["local", "webdav"] = "local"
     root: Path = Path("./recordings")
     webdav: WebDAVConfig = Field(default_factory=WebDAVConfig)
+    # WebDAV always has a persistent, bounded outbox, even in older config files.
+    spool_directory: Path | None = None
+    spool_max_gb: float = Field(default=10.0, gt=0, le=1_048_576)
+    spool_min_free_gb: float = Field(default=1.0, ge=0, le=1_048_576)
+    spool_retry_seconds: float = Field(default=30.0, ge=1.0, le=3600.0)
+    spool_upload_timeout_seconds: float = Field(default=60.0, ge=1.0, le=7200.0)
     timezone: str = "Asia/Shanghai"
     # Fixed batching remains the compatibility default. The generated WebDAV-first config
     # enables adaptive batching, which tunes duration and target bytes from recent bitrate
@@ -437,6 +443,14 @@ def parse_config_text(
     raw = tomllib.loads(text)
     config = AppConfig.model_validate(raw)
     config_dir = Path(base_dir).expanduser().resolve()
+    spool = config.storage.spool_directory
+    if spool is None:
+        spool = Path(os.getenv("CAMVAULT_SPOOL_DIRECTORY", "spool"))
+    config.storage.spool_directory = (
+        spool.expanduser().resolve()
+        if spool.expanduser().is_absolute()
+        else (config_dir / spool).resolve()
+    )
     if not config.storage.root.is_absolute():
         config.storage.root = (config_dir / config.storage.root).resolve()
     else:

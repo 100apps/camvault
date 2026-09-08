@@ -70,6 +70,7 @@ class CamVaultService:
         self.storage_backend = storage_backend or create_storage_backend(
             config.storage, [camera.id for camera in config.cameras]
         )
+        self.storage_backend.on_reclaim = self._reclaim_after_write_failure
         # Acquired by the HTTP route before reading a request body. This prevents stale
         # FFmpeg connections from accumulating multiple full segment payloads per camera.
         self.upload_locks = {camera_id: asyncio.Lock() for camera_id in enabled_ids}
@@ -188,8 +189,14 @@ class CamVaultService:
                     self._ingest_closed = True
                     await self.archive_manager.stop()
                     drain_complete = True
+                    await self.storage_backend.drain_uploads()
             except TimeoutError:
-                logger.error("shutdown drain deadline exceeded after %.1fs", timeout)
+                if drain_complete and self.storage_backend.pending_uploads():
+                    logger.warning(
+                        "shutdown upload deadline reached; pending recordings remain on disk"
+                    )
+                else:
+                    logger.error("shutdown drain deadline exceeded after %.1fs", timeout)
             finally:
                 self._ingest_closed = True
                 # Also clean up on cancellation or an unexpected producer failure.
@@ -209,6 +216,11 @@ class CamVaultService:
                 )
             else:
                 logger.info("shutdown drain complete in %.2fs", time.monotonic() - started)
+                if self.storage_backend.pending_uploads():
+                    logger.warning(
+                        "%d disk outbox batches retained for next startup/WebDAV recovery",
+                        self.storage_backend.pending_uploads(),
+                    )
 
     async def ingest_upload(self, camera_id: str, filename: str, payload: bytes) -> str:
         if self._ingest_closed:

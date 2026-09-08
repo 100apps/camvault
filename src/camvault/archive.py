@@ -627,6 +627,7 @@ class ArchiveManager:
                             self.on_error(camera_id, message)
                         if (
                             not self._closing
+                            and getattr(exc, "allow_reclaim", True)
                             and attempt == 1
                             and self.storage.write_failure_policy == "delete_oldest"
                             and self.on_reclaim is not None

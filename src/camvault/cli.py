@@ -531,7 +531,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     storage_check_parser = subparsers.add_parser(
         "storage-check",
-        help="verify local or WebDAV create/write/move/read/delete without local spooling",
+        help="verify local or WebDAV create/write/move/read/delete and outbox configuration",
     )
     storage_check_parser.add_argument("-c", "--config", default="config.toml")
     storage_check_parser.set_defaults(func=command_storage_check)

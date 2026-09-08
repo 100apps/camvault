@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.10.0 — 2026-09-08
+
+- Always persist sealed WebDAV batches to a bounded disk outbox before uploading, including
+  existing configs with no spool options. Video and audio metadata are encrypted at rest
+  when archive encryption is enabled, atomically sealed with fsync and replayed unchanged.
+- Start while AList is offline, replay after recovery/restart, and remove local copies only
+  after both remote commits succeed. Serve pending footage directly for history/export.
+- Use one streaming replay worker with exponential backoff, per-attempt deadlines, checksums,
+  process locking and destination/key binding. Preserve corrupt/incomplete entries for recovery.
+- Default to 10 GiB total queue capacity and 1 GiB disk reserve; never evict unuploaded footage.
+  Only explicit WebDAV HTTP 507 quota failures may trigger configured cloud oldest-first reclaim.
+- On shutdown, seal the final RAM batch to disk before attempting the remaining uploads.
+  Show pending bytes, disk free space and queue errors in the dashboard; document durability limits.
+
 ## 0.9.1 — 2026-09-07
 
 - On normal stop signals, stop recorders and drain archives before closing HTTP ingest,

@@ -12,4 +12,5 @@ dist/
 config.toml
 config.toml.bak
 recordings/
+spool/
 .env

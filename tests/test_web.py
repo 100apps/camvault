@@ -280,7 +280,7 @@ rtsp_url = "rtsp://127.0.0.1/unused"
         assert "实时监控" in dashboard.text
         assert "历史回放" in dashboard.text
         assert "hls.js@1.7.2" in dashboard.text
-        assert "/assets/dashboard.js?v=11" in dashboard.text
+        assert "/assets/dashboard.js?v=12" in dashboard.text
         assert 'id="playbackRate"' in dashboard.text
         assert 'id="nextSound"' in dashboard.text
         assert 'id="downloadCamera"' in dashboard.text

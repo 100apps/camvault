@@ -9,7 +9,7 @@ import re
 import secrets
 import shutil
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -100,8 +100,83 @@ async def _iter_http_response(
         yield chunk
 
 
+async def _source_chunks(chunks: Iterable[bytes] | AsyncIterable[bytes]) -> AsyncIterator[bytes]:
+    if isinstance(chunks, AsyncIterable):
+        async for chunk in chunks:
+            yield chunk
+    else:
+        for chunk in chunks:
+            yield chunk
+
+
 class StorageBackendError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@dataclass(slots=True)
+class PreparedArchive:
+    record: ArchiveRecord
+    media_chunks: Iterable[bytes] | AsyncIterable[bytes]
+    metadata_chunks: Iterable[bytes] | AsyncIterable[bytes]
+    media_size: int
+    metadata_size: int
+
+
+def prepare_archive(batch: ArchiveBatch, storage: StorageConfig) -> PreparedArchive:
+    """Prepare the same video/index transaction for RAM or durable-disk transport."""
+
+    key = storage.webdav.resolved_encryption_key() if storage.webdav.encryption_enabled else None
+    if storage.webdav.encryption_enabled and key is None:
+        raise StorageBackendError("archive encryption key is required")
+    encrypted = key is not None
+    relative = archive_relative_path(batch, storage) + (".enc" if encrypted else "")
+    context = f"{batch.camera_id}/{relative}"
+    digest = hashlib.sha256()
+    for segment in batch.segments:
+        digest.update(segment.data)
+    record = ArchiveRecord(
+        camera_id=batch.camera_id,
+        path=None,
+        relative_path=relative,
+        start=batch.start.astimezone(UTC),
+        end=batch.end.astimezone(UTC),
+        duration=batch.duration,
+        size_bytes=batch.size_bytes,
+        sha256=digest.hexdigest(),
+        segment_count=len(batch.segments),
+        stream_id=batch.stream_id,
+        audio_index=batch.audio_index,
+        encrypted=encrypted,
+    )
+    metadata = record.as_dict() | {
+        "format": "mpegts",
+        "version": 3,
+        "sequences": [batch.segments[0].sequence, batch.segments[-1].sequence],
+        "object_id": batch.object_id,
+        "backend": "webdav",
+    }
+    metadata_bytes = (json.dumps(metadata, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    media_chunks: Iterable[bytes] = (segment.data for segment in batch.segments)
+    metadata_chunks: Iterable[bytes] = (metadata_bytes,)
+    media_size, metadata_size = batch.size_bytes, len(metadata_bytes)
+    if encrypted:
+        assert key is not None
+        chunk_size = storage.webdav.encryption_chunk_kb * 1024
+        media_chunks = encrypt_archive_chunks(
+            media_chunks, plaintext_size=media_size, chunk_size=chunk_size, key=key, context=context
+        )
+        metadata_chunks = encrypt_archive_chunks(
+            metadata_chunks,
+            plaintext_size=metadata_size,
+            chunk_size=chunk_size,
+            key=key,
+            context=_archive_sidecar_path(context),
+        )
+        media_size = encrypted_size(media_size, chunk_size)
+        metadata_size = encrypted_size(metadata_size, chunk_size)
+    return PreparedArchive(record, media_chunks, metadata_chunks, media_size, metadata_size)
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +233,7 @@ class WebDAVEntry:
 
 
 class StorageBackend:
+    on_reclaim: Callable[[str, int], Awaitable[RetentionResult]] | None = None
     kind: str
     location: str
     diskless_media_path: bool
@@ -168,6 +244,12 @@ class StorageBackend:
 
     async def close(self) -> None:
         raise NotImplementedError
+
+    async def drain_uploads(self) -> None:
+        """Wait for durable pending uploads; non-spooling backends have none."""
+
+    def pending_uploads(self) -> int:
+        return 0
 
     async def health_check(self) -> StorageHealth:
         raise NotImplementedError
@@ -354,7 +436,7 @@ class WebDAVStorageBackend(StorageBackend):
             ),
             verify=self.config.verify_tls,
             follow_redirects=True,
-            headers={"User-Agent": "CamVault/0.9.1", "Accept-Encoding": "identity"},
+            headers={"User-Agent": "CamVault/0.10.0", "Accept-Encoding": "identity"},
         )
 
     @property
@@ -416,13 +498,12 @@ class WebDAVStorageBackend(StorageBackend):
 
     async def write_batch(self, batch: ArchiveBatch) -> ArchiveRecord:
         await self.start()
-        plain_relative = archive_relative_path(batch, self.storage)
-        encryption_key = (
-            self.config.resolved_encryption_key() if self.config.encryption_enabled else None
-        )
-        encrypted = encryption_key is not None
-        relative = f"{plain_relative}.enc" if encrypted else plain_relative
-        camera_relative = PurePosixPath(batch.camera_id, relative).as_posix()
+        return await self.write_prepared(prepare_archive(batch, self.storage))
+
+    async def write_prepared(self, prepared: PreparedArchive) -> ArchiveRecord:
+        await self.start()
+        record = prepared.record
+        camera_relative = f"{record.camera_id}/{record.relative_path}"
         media_path = camera_relative
         metadata_path = _archive_sidecar_path(camera_relative)
         media_partial = _partial_name(media_path)
@@ -430,60 +511,12 @@ class WebDAVStorageBackend(StorageBackend):
         directory_parts = (*self._root_parts, *PurePosixPath(camera_relative).parent.parts)
         await self._ensure_collection_parts(directory_parts)
 
-        digest = hashlib.sha256()
-        for segment in batch.segments:
-            digest.update(segment.data)
-        record = ArchiveRecord(
-            camera_id=batch.camera_id,
-            path=None,
-            relative_path=relative,
-            start=batch.start.astimezone(UTC),
-            end=batch.end.astimezone(UTC),
-            duration=batch.duration,
-            size_bytes=batch.size_bytes,
-            sha256=digest.hexdigest(),
-            segment_count=len(batch.segments),
-            stream_id=batch.stream_id,
-            audio_index=batch.audio_index,
-            encrypted=encrypted,
+        media_chunks, metadata_chunks = prepared.media_chunks, prepared.metadata_chunks
+        media_content_length, metadata_content_length = prepared.media_size, prepared.metadata_size
+        media_content_type = "application/octet-stream" if record.encrypted else "video/mp2t"
+        metadata_content_type = (
+            "application/octet-stream" if record.encrypted else "application/json; charset=utf-8"
         )
-        metadata = record.as_dict() | {
-            "format": "mpegts",
-            "version": 3,
-            "sequences": [batch.segments[0].sequence, batch.segments[-1].sequence],
-            "object_id": batch.object_id,
-            "backend": "webdav",
-        }
-        metadata_bytes = (json.dumps(metadata, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-
-        if encrypted:
-            assert encryption_key is not None
-            encryption_chunk_size = self.config.encryption_chunk_kb * 1024
-            media_chunks: Iterable[bytes] = encrypt_archive_chunks(
-                (segment.data for segment in batch.segments),
-                plaintext_size=batch.size_bytes,
-                chunk_size=encryption_chunk_size,
-                key=encryption_key,
-                context=media_path,
-            )
-            media_content_length = encrypted_size(batch.size_bytes, encryption_chunk_size)
-            metadata_chunks: Iterable[bytes] = encrypt_archive_chunks(
-                (metadata_bytes,),
-                plaintext_size=len(metadata_bytes),
-                chunk_size=encryption_chunk_size,
-                key=encryption_key,
-                context=metadata_path,
-            )
-            metadata_content_length = encrypted_size(len(metadata_bytes), encryption_chunk_size)
-            media_content_type = "application/octet-stream"
-            metadata_content_type = "application/octet-stream"
-        else:
-            media_chunks = (segment.data for segment in batch.segments)
-            media_content_length = batch.size_bytes
-            metadata_chunks = (metadata_bytes,)
-            metadata_content_length = len(metadata_bytes)
-            media_content_type = "video/mp2t"
-            metadata_content_type = "application/json; charset=utf-8"
 
         try:
             if self.config.atomic_upload:
@@ -517,13 +550,13 @@ class WebDAVStorageBackend(StorageBackend):
                     metadata_content_type,
                 )
         except Exception:
-            # Never spool to local disk on retry. Only remove remote transaction objects;
+            # The caller retains the durable spool entry until both commits succeed.
             # committed final media is retained so a retry can finish its sidecar.
             await self._best_effort_delete(media_partial)
             await self._best_effort_delete(metadata_partial)
             raise
 
-        self._invalidate_camera(batch.camera_id)
+        self._invalidate_camera(record.camera_id)
         if self._managed_archive_bytes is not None:
             self._managed_archive_bytes += record.size_bytes
         return record
@@ -1021,7 +1054,7 @@ class WebDAVStorageBackend(StorageBackend):
     async def _put(
         self,
         relative_path: str,
-        chunks: Iterable[bytes],
+        chunks: Iterable[bytes] | AsyncIterable[bytes],
         content_length: int,
         content_type: str,
         *,
@@ -1032,7 +1065,7 @@ class WebDAVStorageBackend(StorageBackend):
         async def body() -> AsyncIterator[bytes]:
             nonlocal source_chunks
             sent = 0
-            for chunk in chunks:
+            async for chunk in _source_chunks(chunks):
                 if not chunk:
                     continue
                 source_chunks += 1
@@ -1178,7 +1211,9 @@ class WebDAVStorageBackend(StorageBackend):
             detail = response.text[:300].replace("\n", " ").strip()
             await response.aclose()
             suffix = f": {detail}" if detail else ""
-            raise StorageBackendError(f"WebDAV {method} returned HTTP {status}{suffix}")
+            raise StorageBackendError(
+                f"WebDAV {method} returned HTTP {status}{suffix}", status_code=status
+            )
         return response
 
     def _url(self, relative_path: str) -> str:
@@ -1204,7 +1239,9 @@ def create_storage_backend(
         if client is not None:
             raise ValueError("an HTTP client can only be injected for the WebDAV backend")
         return LocalStorageBackend(storage)
-    return WebDAVStorageBackend(storage, camera_ids, client=client)
+    from camvault.spool import SpoolingStorageBackend
+
+    return SpoolingStorageBackend(storage, camera_ids, client=client)
 
 
 def _safe_webdav_relative(value: str) -> PurePosixPath:

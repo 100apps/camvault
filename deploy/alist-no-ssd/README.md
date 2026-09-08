@@ -4,6 +4,9 @@ This directory contains only an override fragment. Keep the existing AList image
 user and persistent `data` volume from your deployment, then merge the `alist` service fields
 from `compose.override.example.yml`.
 
+This applies only to AList's temporary files. CamVault 0.10+ always keeps a separate durable
+outbox on persistent disk for outage/restart recovery; never put that outbox in this tmpfs.
+
 After startup, verify inside the container:
 
 ```sh

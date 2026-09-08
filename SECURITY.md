@@ -34,14 +34,15 @@ CamVault is intended for a trusted home LAN or a private overlay network.
 - Existing plaintext `.ts` archives remain readable for compatibility and are not rewritten automatically. Treat them as plaintext until retention deletes them or they are migrated separately.
 - Create a dedicated least-privilege AList account restricted to the CamVault directory. It needs WebDAV read/manage plus create/upload, move/rename and delete capabilities.
 - Keep `atomic_upload = true` only when `camvault storage-check` succeeds against the real configured AList storage. Disabling it weakens incomplete-upload visibility guarantees.
-- `backend = "webdav"` means CamVault creates no local media spool. It does not guarantee that AList's selected cloud driver never uses `temp_dir`; place that directory on tmpfs/RAM disk when media must not touch SSD.
+- `backend = "webdav"` always uses a durable local outbox (default: `spool` beside the config). Each sealed video/index pair is encrypted before it is fsynced locally when encryption is enabled. Directory mode is 0700; file mode is 0600. Metadata manifests contain timing/size/camera information, not credentials or encryption keys. This intentionally replaces the pre-0.10 no-disk policy.
+- Keep the outbox on persistent writable storage, not tmpfs. It binds the destination, account and encryption key; use a new dedicated outbox when changing these and keep the original key/configuration to recover old pending recordings. AList's separate `temp_dir` can still use tmpfs to avoid duplicate SSD writes.
 - AList's persistent SQLite/config data, logs, container runtime logs, Python bytecode and operating-system swap are separate write paths. Move, disable or constrain them according to the required SSD policy.
 - Treat remote deletion as destructive. Use a dedicated root such as `/Cloud/CamVault`; do not point retention at a shared WebDAV directory.
 - Do not disable TLS verification for a remote WebDAV endpoint. Plain HTTP is acceptable only over loopback or a separately trusted private tunnel.
 
 ## Failure model
 
-WebDAV outage data remains in bounded RAM and is retried without falling back to disk. Once the memory budget is exhausted, ingest is backpressured and new footage may be lost. A local HDD/NVR or camera SD card is required for long offline retention.
+Sealed WebDAV batches survive outages and process restarts in the encrypted disk outbox; they are removed only after video and sidecar commits both succeed. The default queue limit is 10 GiB with 1 GiB disk free-space reserve. Unuploaded footage is never automatically evicted: a full or unwritable disk eventually backpressures ingest, so new footage can still be lost. Sudden power loss/SIGKILL can lose the unsealed RAM batch or an interrupted local write; normal stop first attempts to seal it. Filesystem/device durability guarantees still apply. A UPS and camera SD card provide additional protection.
 
 ## Reporting
 

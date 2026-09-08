@@ -61,7 +61,7 @@ async def test_signal_commits_encrypted_ram_and_final_http_segment(
             sys.executable,
             str(Path(__file__).parent / "helpers" / "shutdown_server.py"),
             str(dav.server_address[1]),
-            str(tmp_path / "no-local-spool"),
+            str(tmp_path / "unused-local-recordings"),
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -93,7 +93,9 @@ async def test_signal_commits_encrypted_ram_and_final_http_segment(
         )
         assert metadata["segment_count"] == 2
         assert metadata["audio_index"][-1]["active"] is True
-        assert not (tmp_path / "no-local-spool").exists()
+        assert not (tmp_path / "unused-local-recordings").exists()
+        assert (tmp_path / "spool" / ".target.json").exists()
+        assert not [path for path in (tmp_path / "spool").iterdir() if path.is_dir()]
     finally:
         if process is not None and process.returncode is None:
             process.kill()

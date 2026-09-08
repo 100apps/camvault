@@ -44,6 +44,8 @@ async def main() -> None:
         storage=StorageConfig(
             backend="webdav",
             root=Path(sys.argv[2]),
+            spool_directory=Path(sys.argv[2]).parent / "spool",
+            spool_min_free_gb=0,
             archive_chunk_seconds=1800,
             adaptive_archive_enabled=True,
             max_buffer_mb_per_camera=64,

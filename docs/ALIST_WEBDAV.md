@@ -2,6 +2,7 @@
 
 > 研究与验证基线：2026-09-04；AList `main` 提交
 > `e1c022a9d920559078e5a906d7e1499901857006`，发布版 v3.64.0。
+> CamVault 行为更新至 0.10.0（2026-09-08）：默认持久磁盘兜底，取代早期“零媒体落盘”策略。
 
 ## 1. 结论
 
@@ -14,17 +15,20 @@ CamVault 的 WebDAV 后端按以下媒体路径工作：
   -> CamVault 有界 RAM
   -> RAM 中聚合成较大归档批次
   -> 分块 AES-256-GCM 加密并认证
+  -> 持久磁盘队列（fsync + 原子封口）
   -> WebDAV PUT 事务对象
   -> WebDAV MOVE 提交
   -> AList 存储驱动
   -> 远程网盘
 ```
 
-在 `storage.backend = "webdav"` 时，CamVault 不创建 `storage.root`，不生成本地录像、
-临时录像或失败回退文件。媒体字节从 FFmpeg 进入内存后直接作为 HTTP 请求体发送给
-AList。
+在 `storage.backend = "webdav"` 时，CamVault 不创建本地后端的 `storage.root`，
+而使用独立的 `spool_directory`。每个封口批次先加密保存到磁盘，视频和声音索引均完成
+WebDAV 提交后才删除本地副本；服务离线启动、上传失败和进程重启均可自动补传。
+旧配置不写新参数时，默认目录为配置文件旁的 `spool`（本路由器 `/data/camvault/spool`）。
 
-但是“整个系统绝对不写 SSD”不能只靠 CamVault 一个开关保证，必须同时处理：
+这意味着每份新录像至少有一次必要的持久顺序写入，不再承诺零 SSD 写入。
+如需保护系统 SSD，可把队列放到监控 HDD。除此之外还需注意：
 
 1. AList 某些网盘驱动可能为了哈希、分片或随机读取使用自己的 `temp_dir`；
 2. AList 默认 SQLite、配置和文件日志位于 `data` 目录；
@@ -35,7 +39,7 @@ AList。
 
 | 目标 | 可达到程度 | 条件 |
 |---|---|---|
-| 录像媒体不落本机文件系统 | 可以，由 CamVault 保证 | `backend="webdav"`，无本地 fallback |
+| 离线/重启后补传已封口录像 | 默认支持 | WebDAV 持久磁盘队列，不能放 tmpfs |
 | AList 上传临时媒体不落 SSD | 可以，部署层保证 | `temp_dir` 指向 tmpfs/RAM disk |
 | 所有程序和系统元数据绝对零 SSD I/O | 通常不值得承诺 | AList data/log、服务日志、swap、容器层都需迁移或关闭 |
 
@@ -49,15 +53,15 @@ AList。
 - AList 的完整缓存路径最终通过 `CreateTempFile` 落到配置项 `temp_dir`；
 - AList 官方配置文档也说明 `temp_dir` 默认是 `data/temp`，启动时会清空。
 
-所以正确架构是“双层零落盘”：
+因此两类目录必须分开：
 
 ```text
-CamVault：禁止本地媒体 spool
-AList：把 temp_dir 放到 RAM
+CamVault spool：持久磁盘，保存待补传密文，不可放 RAM
+AList temp_dir：可选 RAM，减少驱动自身的重复临时写入
 ```
 
-只做第一层，无法约束某个网盘驱动内部的临时文件；只做第二层，CamVault 自己若先写文件
-再上传，仍会磨损 SSD。
+CamVault 的持久队列负责故障恢复；AList 临时目录的 RAM 配置只是一项独立的写入优化，
+不能替代队列。下面有关 AList 内部临时文件的源码分析仍以文首基线为准。
 
 源码位置：
 
@@ -209,7 +213,7 @@ OPTIONS -> MKCOL -> PUT -> MOVE -> GET -> DELETE
 ```json
 {
   "backend": "webdav",
-  "diskless_media_path": true
+  "diskless_media_path": false
 }
 ```
 
@@ -379,9 +383,9 @@ max_buffer_mb_per_camera + max_live_memory_mb_per_camera
 
 接收 HTTP 分片时还有最多一个分片的瞬时缓冲。多个摄像头按台数线性增加。
 
-如果 PUT/MOVE 因远端容量不足而首次失败，默认策略会扫描已提交记录、按时间删除最旧录像，
+如果 PUT/MOVE 首次明确返回 HTTP 507 容量不足，默认策略会扫描已提交记录、按时间删除最旧录像，
 至少尝试回收 `write_failure_reclaim_mb`，但不超过
-`write_failure_max_delete_files`，随后立即重试同一个确定性事务。把
+`write_failure_max_delete_files`，随后重试同一个确定性事务。把
 `write_failure_policy` 设为 `retry` 可禁用错误触发的删除，仅保留退避重试。
 
 AList 的 tmpfs 容量应覆盖底层驱动最坏情况下同时缓存的完整上传。保守估算：
@@ -396,22 +400,25 @@ AList tmpfs >= 最大单批次 × 可能并发上传数 × 1.25
 
 ### AList 或网盘短时不可用
 
-- 已封存批次保留在 RAM 并指数退避重试；
-- CamVault 不切换到本地 SSD；
-- 达到每摄像头 RAM 上限后，后续 FFmpeg 上传被反压；
-- 网络恢复后，当前保留批次继续提交；
-- 故障期间超过 RAM 能力的新录像无法被无限保存，可能形成录像缺口。
+- 已封存批次始终先保存到持久磁盘，单个后台任务按时间补传；
+- 默认 30 秒重试，连续失败指数退避到最长 300 秒，单批总超时默认 60 秒；
+- 磁盘队列默认上限 10 GiB，保留 1 GiB 空闲，可由 `storage.spool_*` 调整；
+- 视频及声音索引都提交成功后才删除本地副本，重试直接读取原密文，不重新加密；
+- 本地队列满/不可写时保留待传文件并报警，随后达到 RAM 上限会反压，不能无限缓存。
 
-这是“零本地 spool”与“任意长离线容灾”之间不可消除的矛盾。要保证长时间断网也不丢录像，
-必须增加 HDD spool、摄像头 SD 卡/NVR，或允许更大的内存；三者至少选一个。
+待传录像不参加自动过期删除；仅明确的 WebDAV HTTP 507 配额失败可触发配置的云端
+最旧录像回收，断网/认证错误/本地满不会触发该删除。长时间离线能力取决于队列容量和
+总码率；摄像头 SD 卡/NVR 可以提供额外保障。
 
 ### 进程或机器突然退出
 
-尚未提交的 RAM 批次会丢失。风险窗口由以下较小值决定：
+已经 fsync 封口的磁盘批次会在下次启动时恢复；尚未封口的 RAM 批次或中断的本地写入
+仍可能丢失。正常 SIGTERM/SIGINT 会先尝试把最后一批保存到磁盘，再限时补传。
+风险窗口由以下较小值决定：
 
 ```text
-archive_chunk_seconds
-max_buffer_mb_per_camera / 实际码率
+当前固定或自适应目标秒数
+当前批次目标字节 / 实际字节率
 ```
 
 ### MOVE 成功但客户端超时
@@ -462,7 +469,8 @@ min_free_gb = 0
 
 - [ ] CamVault 使用 `storage.backend = "webdav"`；
 - [ ] `uv run camvault storage-check` 成功；
-- [ ] CamVault 状态接口显示 `diskless_media_path=true`、`local_media_spool=false`；
+- [ ] CamVault 状态接口显示 `diskless_media_path=false`、`local_media_spool=true`；
+- [ ] `spool.directory` 位于持久磁盘，待传批次、空闲空间和错误状态可见；
 - [ ] 配置中的本地 `storage.root` 路径没有被创建；
 - [ ] AList `temp_dir` 位于 tmpfs/RAM disk；
 - [ ] AList 持久 `data` 在 HDD，或明确接受 SSD 上少量 SQLite/config 写入；
