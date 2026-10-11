@@ -63,6 +63,37 @@
     return `${number.toFixed(digits)} ${units[index]}`;
   }
 
+  function capacityBytes(value) {
+    if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
+    const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let number = Number(value);
+    let index = 0;
+    while (Math.abs(number) >= 1000 && index < units.length - 1) {
+      number /= 1000;
+      index += 1;
+    }
+    return `${Number(number.toFixed(index === 0 ? 0 : 2))} ${units[index]}`;
+  }
+
+  function storageSummary(capacity, policy) {
+    const limit = Number(policy.max_storage_gb || 0) * 1024 ** 3;
+    const managed = capacity.managed_archive_bytes;
+    const archiveQuota = limit > 0 && managed !== null && managed !== undefined;
+    const total = archiveQuota ? limit : capacity.total_bytes;
+    const used = archiveQuota ? managed : capacity.used_bytes;
+    const known = total > 0 && used !== null && used !== undefined && Number.isFinite(Number(used));
+    const percent = known ? Math.max(0, used / total * 100) : null;
+    return {
+      label: known ? `${percent.toFixed(1)}%` : humanBytes(managed),
+      detail: archiveQuota
+        ? `${capacityBytes(managed)} 已用 / ${capacityBytes(limit)} 归档上限`
+        : known
+          ? `${capacityBytes(used)} 已用 · ${capacityBytes(capacity.free_bytes)} 可用（存储总配额）`
+          : "CamVault 归档 · 未提供总配额，使用率未知",
+      percent,
+    };
+  }
+
   function showToast(message, error = false) {
     const box = $("toast");
     box.textContent = message;
@@ -238,7 +269,7 @@
       $("writeBitrate").textContent = `平均 ${Number(data.write_mbps_last_minute || 0).toFixed(2)} Mbit/s`;
 
       const capacity = data.storage.capacity || {};
-      const managed = capacity.managed_archive_bytes;
+      const policy = data.retention.policy;
       const protection = data.storage.encryption?.enabled ? " · AES-256-GCM 已加密" : "";
       const batching = data.archive_batching || {};
       const spool = data.storage.spool;
@@ -267,28 +298,22 @@
       const batchPolicy = targetSeconds.length
         ? ` · ${batching.adaptive ? "自动" : "固定"} ${interval}/批，目标≤${humanBytes(Math.max(...targetBytes))}`
         : "";
-      if (capacity.total_bytes !== null && capacity.total_bytes !== undefined) {
-        const percent = capacity.total_bytes > 0
-          ? Math.min(100, capacity.used_bytes / capacity.total_bytes * 100)
-          : 0;
-        $("storageUsage").textContent = `${percent.toFixed(1)}%`;
-        $("storageDetail").textContent = `${humanBytes(capacity.used_bytes)} 已用 · ${humanBytes(capacity.free_bytes)} 可用 · ${data.storage.backend.toUpperCase()}${protection}${batchPolicy}${spoolInfo}`;
-        $("storageMeter").style.width = `${percent}%`;
-      } else {
-        $("storageUsage").textContent = humanBytes(managed);
-        $("storageDetail").textContent = `CamVault 归档 · ${data.storage.backend.toUpperCase()} 未提供总配额${protection}${batchPolicy}${spoolInfo}`;
-        $("storageMeter").style.width = "0";
-      }
+      const summary = storageSummary(capacity, policy);
+      $("storageUsage").textContent = summary.label;
+      $("storageDetail").textContent = summary.detail;
+      $("storageAux").textContent = `${data.storage.backend.toUpperCase()}${protection}`;
+      $("storageAux").title = `${batchPolicy}${spoolInfo}`.replace(/^ · /, "");
+      $("storageMeter").style.width = `${Math.min(100, summary.percent || 0)}%`;
+      $("storageMeter").classList.toggle("warning", summary.percent >= 90);
+      $("storageUsage").title = summary.detail;
 
-      const policy = data.retention.policy;
-      $("retention").textContent = policy.retention_days
-        ? `保留 ${policy.retention_days} 天`
-        : policy.max_storage_gb
-          ? `上限 ${policy.max_storage_gb} GiB`
-          : "按可用空间";
+      $("retention").textContent = policy.max_storage_gb
+        ? `上限 ${capacityBytes(Number(policy.max_storage_gb) * 1024 ** 3)}`
+        : policy.retention_days ? `保留 ${policy.retention_days} 天` : "不限保存时间";
       $("retentionDetail").textContent = data.retention.last_error
         ? `上次清理失败：${data.retention.last_error}`
-        : `写入失败时删除最老录像 · 已运行 ${data.retention.runs} 次`;
+        : `${policy.retention_days ? `保留 ${policy.retention_days} 天` : "不限天数"} · ${policy.write_failure_policy === "delete_oldest" ? "写入失败时删除最老录像" : "写入失败时重试"}`;
+      $("retentionDetail").title = `清理策略已运行 ${data.retention.runs} 次`;
 
       data.cameras.forEach((camera) => {
         const dot = $(`dot-${camera.id}`);

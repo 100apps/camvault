@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.2 — 2026-10-11
+
+- Display readable decimal archive limits (e.g. 3 TB), archive usage percentage and a
+  quota meter. Prefer the configured CamVault archive cap over provider-wide quota;
+  explicitly report unknown usage when neither quota is available.
+- Show complete, wrapping capacity/policy details, keep upload diagnostics in the
+  backend tooltip, and invalidate cached dashboard assets. No extra polling or scans.
+
 ## 0.10.1 — 2026-10-11
 
 - Recover ambiguous WebDAV MOVE commits, including AList/Baidu HTTP 500 on an

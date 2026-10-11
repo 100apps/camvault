@@ -903,14 +903,14 @@ def create_app(
         )
         page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark">
-<title>CamVault · 监控中心</title><link rel="stylesheet" href="/assets/dashboard.css?v=12">
+<title>CamVault · 监控中心</title><link rel="stylesheet" href="/assets/dashboard.css?v=13">
 <script defer src="https://cdn.jsdelivr.net/npm/hls.js@1.7.2/dist/hls.min.js"></script>
-<script>window.CAMVAULT_BOOTSTRAP={bootstrap};</script><script defer src="/assets/dashboard.js?v=12"></script></head>
+<script>window.CAMVAULT_BOOTSTRAP={bootstrap};</script><script defer src="/assets/dashboard.js?v=13"></script></head>
 <body><header class="app-header"><a class="brand" href="/"><span class="brand-mark"><i></i></span><span><b>CamVault</b><small>视频归档系统</small></span></a>
 <nav><button class="nav-item active" data-view="monitor">监控中心</button><button class="nav-item" data-view="system">系统管理</button></nav>
 <div class="header-actions"><span class="health-chip" id="overall"><i></i>正在连接</span><button class="icon-button" id="logout" title="退出登录" hidden>退出</button></div></header>
 <main><section id="monitorView"><div class="section-heading"><div><p class="eyebrow">OVERVIEW</p><h1>监控中心</h1><p>主码流实时预览与连续录像归档</p></div><time id="clock"></time></div>
-<section class="metrics"><article><span>存储使用</span><strong id="storageUsage">—</strong><small id="storageDetail">正在读取容量</small><div class="meter"><i id="storageMeter"></i></div></article>
+<section class="metrics"><article><span>存储使用</span><strong id="storageUsage">—</strong><small id="storageDetail">正在读取容量</small><small id="storageAux"></small><div class="meter"><i id="storageMeter"></i></div></article>
 <article><span>最近 60 秒写入</span><strong id="writeRate">—</strong><small id="writeBitrate">—</small></article>
 <article><span>归档策略</span><strong id="retention">—</strong><small id="retentionDetail">—</small></article>
 <article><span>内存媒体缓冲</span><strong id="memory">—</strong><small>实时分片与待上传数据</small></article></section>
