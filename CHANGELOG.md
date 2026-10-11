@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.1 — 2026-10-11
+
+- Recover ambiguous WebDAV MOVE commits, including AList/Baidu HTTP 500 on an
+  already-present destination. Stream-verify the destination's full SHA-256 and size
+  before acknowledging the commit and finishing its encrypted metadata sidecar.
+- Reject same-size conflicting destination contents without replacing the final object
+  or discarding the durable local outbox. Verification is bounded to 128 KiB chunks
+  and runs only on failed/ambiguous commits.
+
 ## 0.10.0 — 2026-09-08
 
 - Always persist sealed WebDAV batches to a bounded disk outbox before uploading, including

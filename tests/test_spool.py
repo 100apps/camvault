@@ -275,10 +275,12 @@ async def test_offline_start_disk_range_playback_restart_and_exact_ciphertext_re
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("existing_destination_status", [412, 500])
 async def test_partial_remote_commit_keeps_local_pair_until_sidecar_succeeds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing_destination_status: int
 ) -> None:
     cloud = MemoryWebDAV()
+    cloud.existing_destination_move_status = existing_destination_status
     fail_metadata = [True]
 
     async def transport(request: httpx.Request) -> httpx.Response:

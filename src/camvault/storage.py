@@ -436,7 +436,7 @@ class WebDAVStorageBackend(StorageBackend):
             ),
             verify=self.config.verify_tls,
             follow_redirects=True,
-            headers={"User-Agent": "CamVault/0.10.0", "Accept-Encoding": "identity"},
+            headers={"User-Agent": "CamVault/0.10.1", "Accept-Encoding": "identity"},
         )
 
     @property
@@ -471,8 +471,8 @@ class WebDAVStorageBackend(StorageBackend):
         destination = PurePosixPath(*directory, f"{token}.ok").as_posix()
         payload = b"CamVault WebDAV streaming health check\n"
         try:
-            await self._put(source, (payload,), len(payload), "application/octet-stream")
-            await self._move(source, destination)
+            digest = await self._put(source, (payload,), len(payload), "application/octet-stream")
+            await self._move(source, destination, len(payload), digest)
             response = await self._request(
                 "GET",
                 self._url(destination),
@@ -520,21 +520,23 @@ class WebDAVStorageBackend(StorageBackend):
 
         try:
             if self.config.atomic_upload:
-                await self._put(
+                media_digest = await self._put(
                     media_partial,
                     media_chunks,
                     media_content_length,
                     media_content_type,
                     track_media=True,
                 )
-                await self._move(media_partial, media_path)
-                await self._put(
+                await self._move(media_partial, media_path, media_content_length, media_digest)
+                metadata_digest = await self._put(
                     metadata_partial,
                     metadata_chunks,
                     metadata_content_length,
                     metadata_content_type,
                 )
-                await self._move(metadata_partial, metadata_path)
+                await self._move(
+                    metadata_partial, metadata_path, metadata_content_length, metadata_digest
+                )
             else:
                 await self._put(
                     media_path,
@@ -1059,8 +1061,9 @@ class WebDAVStorageBackend(StorageBackend):
         content_type: str,
         *,
         track_media: bool = False,
-    ) -> None:
+    ) -> str:
         source_chunks = 0
+        digest = hashlib.sha256()
 
         async def body() -> AsyncIterator[bytes]:
             nonlocal source_chunks
@@ -1072,6 +1075,7 @@ class WebDAVStorageBackend(StorageBackend):
                 sent += len(chunk)
                 if sent > content_length:
                     raise StorageBackendError("WebDAV upload exceeded declared Content-Length")
+                digest.update(chunk)
                 yield chunk
                 await asyncio.sleep(0)
             if sent != content_length:
@@ -1089,24 +1093,60 @@ class WebDAVStorageBackend(StorageBackend):
         if track_media:
             self._last_media_upload_source_chunks = source_chunks
         await response.aclose()
+        return digest.hexdigest()
 
-    async def _move(self, source: str, destination: str) -> None:
-        response = await self._request(
-            "MOVE",
-            self._url(source),
-            expected={200, 201, 204, 405, 409, 412},
-            headers={"Destination": self._url(destination), "Overwrite": "F"},
-        )
+    async def _move(
+        self, source: str, destination: str, expected_size: int, expected_digest: str
+    ) -> None:
+        try:
+            response = await self._request(
+                "MOVE",
+                self._url(source),
+                expected={200, 201, 204, 404, 405, 409, 412},
+                headers={"Destination": self._url(destination), "Overwrite": "F"},
+            )
+        except StorageBackendError as exc:
+            # AList/Baidu can commit a rename and return 500, or return 500 when a
+            # retry finds the final name already present. Verify actual bytes before
+            # acknowledging the transaction; mere existence/size is insufficient.
+            if exc.status_code not in {None, 500, 502, 503, 504}:
+                raise
+            if not await self._object_matches(destination, expected_size, expected_digest):
+                raise
+            await self._best_effort_delete(source)
+            return
         status = response.status_code
         await response.aclose()
         if status in {200, 201, 204}:
             return
         # A retry can see the destination already committed. Treat that as idempotent and
         # remove only the fresh partial source.
-        if await self._exists(destination):
-            await self._delete(source, ignore_missing=True)
+        if await self._object_matches(destination, expected_size, expected_digest):
+            await self._best_effort_delete(source)
             return
-        raise StorageBackendError(f"WebDAV MOVE returned HTTP {status}")
+        raise StorageBackendError(f"WebDAV MOVE returned HTTP {status}", status_code=status)
+
+    async def _object_matches(self, relative_path: str, size: int, digest: str) -> bool:
+        """Bounded streaming verification used only for ambiguous commits/retries."""
+        try:
+            async with self.client.stream(
+                "GET", self._url(relative_path), headers={"Accept-Encoding": "identity"}
+            ) as response:
+                if response.status_code != 200:
+                    return False
+                declared = response.headers.get("content-length")
+                if declared is not None and declared != str(size):
+                    return False
+                actual = hashlib.sha256()
+                received = 0
+                async for chunk in response.aiter_bytes(chunk_size=128 * 1024):
+                    received += len(chunk)
+                    if received > size:
+                        return False
+                    actual.update(chunk)
+                return received == size and secrets.compare_digest(actual.hexdigest(), digest)
+        except httpx.HTTPError:
+            return False
 
     async def _delete(self, relative_path: str, *, ignore_missing: bool) -> None:
         response = await self._request(

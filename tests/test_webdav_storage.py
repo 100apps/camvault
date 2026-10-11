@@ -36,6 +36,7 @@ class MemoryWebDAV:
         self.media_put_content_lengths: list[str | None] = []
         self.fail_next_media_put = False
         self.commit_then_fail_next_media_move = False
+        self.existing_destination_move_status = 412
         self.quota_available = 10 * 1024**3
 
     @staticmethod
@@ -90,7 +91,7 @@ class MemoryWebDAV:
             if path not in self.files:
                 return httpx.Response(404)
             if destination in self.files and request.headers.get("overwrite") == "F":
-                return httpx.Response(412)
+                return httpx.Response(self.existing_destination_move_status)
             parent = self._norm(str(Path(destination).parent).replace("\\", "/"))
             if parent not in self.directories:
                 return httpx.Response(409)
@@ -400,8 +401,7 @@ async def test_webdav_retry_after_ambiguous_move_is_idempotent(tmp_path: Path) -
     start = datetime.now(UTC)
     batch = ArchiveBatch(camera_id="front", segments=(_segment(1, b"one-commit", start),))
     try:
-        with pytest.raises(StorageBackendError, match="HTTP 500"):
-            await backend.write_batch(batch)
+        record = await backend.write_batch(batch)
 
         committed_media = [path for path in server.files if path.endswith(".ts")]
         assert len(committed_media) == 1
@@ -415,6 +415,34 @@ async def test_webdav_retry_after_ambiguous_move_is_idempotent(tmp_path: Path) -
         assert committed_media[0].replace(".ts", ".json") in server.files
         assert not any(path.endswith(".camvault-partial") for path in server.files)
         assert not storage.root.exists()
+    finally:
+        await backend.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_content", [True, False])
+async def test_webdav_500_on_existing_destination_verifies_content(
+    tmp_path: Path, same_content: bool
+) -> None:
+    server = MemoryWebDAV()
+    server.existing_destination_move_status = 500
+    client = httpx.AsyncClient(transport=httpx.MockTransport(server))
+    backend = WebDAVStorageBackend(_storage(tmp_path), ["front"], client=client)
+    batch = ArchiveBatch(camera_id="front", segments=(_segment(1, b"original", datetime.now(UTC)),))
+    try:
+        record = await backend.write_batch(batch)
+        path = next(path for path in server.files if path.endswith(record.relative_path))
+        if not same_content:
+            server.files[path] = b"tampered"  # Same length: existence/size cannot detect this.
+            with pytest.raises(StorageBackendError, match="HTTP 500"):
+                await backend.write_batch(batch)
+            assert server.files[path] == b"tampered"
+        else:
+            await backend.write_batch(batch)
+            assert server.files[path] == b"original"
+            assert path.replace(".ts", ".json") in server.files
+        assert not any(path.endswith(".camvault-partial") for path in server.files)
     finally:
         await backend.close()
         await client.aclose()
